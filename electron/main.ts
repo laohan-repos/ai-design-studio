@@ -13,10 +13,13 @@ const apiRoot = (value: string) => value.trim().replace(/\/$/, '').replace(/\/im
 const imageEndpoint = (value: string, action: 'generations' | 'edits') => `${apiRoot(value)}/images/${action}`
 const withFullEndpoint = (model: ModelConfig): ModelConfig => ({ ...model, baseUrl: imageEndpoint(model.baseUrl, model.taskType === 'text-to-image' ? 'generations' : 'edits') })
 
+// Keep using the existing data directory after the user-facing product rename.
+app.setPath('userData', join(app.getPath('appData'), 'lumina-ai-design-studio'))
+
 async function createWindow() {
   const win = new BrowserWindow({
     width: 1440, height: 920, minWidth: 1080, minHeight: 720,
-    titleBarStyle: 'hiddenInset', backgroundColor: '#f8fafc',
+    title: 'AI设计助手', titleBarStyle: 'hiddenInset', backgroundColor: '#f8fafc',
     webPreferences: {
       preload: join(__dirname, '../preload/preload.cjs'),
       contextIsolation: true,
@@ -47,9 +50,16 @@ app.whenReady().then(async () => {
     return true
   })
   ipcMain.handle('model:test', async (_e, model: ModelConfig) => testModelConnection(model))
-  ipcMain.handle('artworks:list', () => database.listArtworks())
+  ipcMain.handle('canvases:list', () => database.listCanvases())
+  ipcMain.handle('canvases:create', async (_e, id: string, name: string) => database.createCanvas(id, name))
+  ipcMain.handle('canvases:rename', async (_e, id: string, name: string) => database.renameCanvas(id, name))
+  ipcMain.handle('artworks:list', (_e, canvasId: string) => database.listArtworks(canvasId))
   ipcMain.handle('artworks:save', async (_e, artworks) => { await database.saveArtworks(artworks); return true })
   ipcMain.handle('artworks:move', async (_e, id: string, x: number, y: number) => { await database.moveArtwork(id, x, y); return true })
+  ipcMain.handle('artworks:delete', async (_e, id: string) => { await database.deleteArtwork(id); return true })
+  ipcMain.handle('artwork-versions:list', (_e, artworkId: string) => database.listArtworkVersions(artworkId))
+  ipcMain.handle('artwork-versions:save', async (_e, version) => { await database.saveArtworkVersion(version); return true })
+  ipcMain.handle('artwork-versions:apply', (_e, artworkId: string, versionId: string) => database.applyArtworkVersion(artworkId, versionId))
   ipcMain.handle('image:generate', async (_e, payload) => generateImage(payload))
   ipcMain.handle('image:save', async (_e, dataUrl: string, suggestedName: string) => {
     const extension = extname(suggestedName) || '.png'

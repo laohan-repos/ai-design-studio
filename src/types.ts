@@ -21,12 +21,32 @@ export type Adjustments = { brightness: number; contrast: number; saturation: nu
 
 export type Artwork = {
   id: string
+  canvasId: string
   src: string
   prompt: string
   createdAt: number
   x: number
   y: number
   width: number
+}
+
+export type ArtworkVersion = {
+  id: string
+  artworkId: string
+  src: string
+  prompt: string
+  createdAt: number
+  versionNumber: number
+  isCurrent: boolean
+}
+
+export type InfiniteCanvasRecord = {
+  id: string
+  name: string
+  createdAt: number
+  updatedAt: number
+  artworkCount: number
+  coverSrc?: string
 }
 
 export type ModelTestResult = {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Focus, Hand, Minus, MousePointer2, Plus, Scan } from 'lucide-react'
+import { Focus, Hand, Minus, MousePointer2, Pencil, Plus, Scan, Trash2 } from 'lucide-react'
 import { Button } from './ui/button'
 import type { Artwork } from '@/types'
 
@@ -15,17 +15,19 @@ type Interaction =
 type Props = {
   items: CanvasImage[]
   selectedIds: string[]
+  focusArtwork?: { id: string; sequence: number }
   onSelect(ids: string[]): void
   onMove(updates: Array<{ id: string; x: number; y: number }>): void
   onMoveEnd(updates: Array<{ id: string; x: number; y: number }>): void
-  onEdit(src: string): void
+  onEdit(item: CanvasImage): void
+  onDelete(item: CanvasImage): void
   onUpload(): void
 }
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
 const nodeHeight = (item: CanvasImage) => item.width + 72
 
-export function InfiniteCanvas({ items, selectedIds, onSelect, onMove, onMoveEnd, onEdit, onUpload }: Props) {
+export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onMove, onMoveEnd, onEdit, onDelete, onUpload }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const interaction = useRef<Interaction>()
   const spacePressed = useRef(false)
@@ -35,6 +37,7 @@ export function InfiniteCanvas({ items, selectedIds, onSelect, onMove, onMoveEnd
   const [panning, setPanning] = useState(false)
   const [, forceCursor] = useState(0)
   const [marquee, setMarquee] = useState<{ left: number; top: number; width: number; height: number }>()
+  const [imageMenu, setImageMenu] = useState<{ item: CanvasImage; x: number; y: number }>()
   useEffect(() => { viewRef.current = view }, [view])
 
   const frameBounds = useCallback((targets: CanvasImage[], maxZoom = 1.35) => {
@@ -54,6 +57,18 @@ export function InfiniteCanvas({ items, selectedIds, onSelect, onMove, onMoveEnd
     if (selected.length) frameBounds(selected, 2)
   }, [items, selectedIds, frameBounds])
 
+  useEffect(() => {
+    if (!focusArtwork) return
+    const item = items.find(candidate => candidate.id === focusArtwork.id)
+    const rect = host.current?.getBoundingClientRect()
+    if (!item || !rect) return
+    setView(current => ({
+      ...current,
+      x: rect.width / 2 - (item.x + item.width / 2) * current.zoom,
+      y: rect.height / 2 - (item.y + nodeHeight(item) / 2) * current.zoom
+    }))
+  }, [focusArtwork?.sequence])
+
   useEffect(() => { if (items.length === 1) requestAnimationFrame(fitAll) }, [items.length, fitAll])
   useEffect(() => {
     const editable = (target: EventTarget | null) => target instanceof HTMLElement && (target.matches('input, textarea, select') || target.isContentEditable)
@@ -62,7 +77,7 @@ export function InfiniteCanvas({ items, selectedIds, onSelect, onMove, onMoveEnd
       if (event.code === 'Space') { event.preventDefault(); spacePressed.current = true; forceCursor(value => value + 1) }
       if (event.key.toLowerCase() === 'v') setTool('select')
       if (event.key.toLowerCase() === 'h') setTool('hand')
-      if (event.key === 'Escape') onSelect([])
+      if (event.key === 'Escape') { onSelect([]); setImageMenu(undefined) }
       if (event.key === '1' && !event.shiftKey) setView(v => ({ ...v, zoom: 1 }))
       if ((event.key === '1' && event.shiftKey) || event.key === '0') fitAll()
       if (event.key === '2' && event.shiftKey) fitSelection()
@@ -141,14 +156,33 @@ export function InfiniteCanvas({ items, selectedIds, onSelect, onMove, onMoveEnd
   }
   const cursor = panning ? 'cursor-grabbing' : spacePressed.current || tool === 'hand' ? 'cursor-grab' : 'cursor-default'
 
-  return <div ref={host} tabIndex={0} onPointerDown={startCanvas} onPointerMove={move} onPointerUp={end} onPointerCancel={end} className={`relative h-full w-full touch-none overflow-hidden bg-[#f8f9fc] outline-none ${cursor}`} style={{ backgroundImage: 'radial-gradient(circle, #cfd3dc 1px, transparent 1.25px)', backgroundPosition: `${view.x}px ${view.y}px`, backgroundSize: `${24 * view.zoom}px ${24 * view.zoom}px` }}>
+  const openImageMenu = (event: React.MouseEvent, item: CanvasImage) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const rect = host.current?.getBoundingClientRect()
+    if (!rect) return
+    onSelect([item.id])
+    setImageMenu({
+      item,
+      x: Math.min(event.clientX - rect.left, rect.width - 176),
+      y: Math.min(event.clientY - rect.top, rect.height - 56)
+    })
+  }
+
+  return <div ref={host} tabIndex={0} onPointerDown={startCanvas} onPointerMove={move} onPointerUp={end} onPointerCancel={end} onContextMenu={event => event.preventDefault()} className={`relative h-full w-full touch-none overflow-hidden bg-[#f8f9fc] outline-none ${cursor}`} style={{ backgroundImage: 'radial-gradient(circle, #cfd3dc 1px, transparent 1.25px)', backgroundPosition: `${view.x}px ${view.y}px`, backgroundSize: `${24 * view.zoom}px ${24 * view.zoom}px` }}>
     <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_35%,rgba(240,242,247,.38)_100%)]" />
     <div className="absolute left-0 top-0 will-change-transform" style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})`, transformOrigin: '0 0' }}>
-      {items.map(item => <article key={item.id} onPointerDown={event => startNode(event, item)} onDoubleClick={event => { event.stopPropagation(); onEdit(item.src) }} className={`absolute select-none overflow-hidden rounded-2xl bg-white shadow-[0_12px_40px_rgba(21,28,45,.12)] transition-[box-shadow] ${tool === 'hand' || spacePressed.current ? 'cursor-grab' : 'cursor-move'} ${selectedIds.includes(item.id) ? 'ring-[3px] ring-violet-500 shadow-[0_18px_55px_rgba(124,58,237,.2)]' : 'ring-1 ring-black/5 hover:ring-black/10'}`} style={{ left: item.x, top: item.y, width: item.width }}>
+      {items.map(item => <article key={item.id} onPointerDown={event => startNode(event, item)} onContextMenu={event => openImageMenu(event, item)} onDoubleClick={event => { event.stopPropagation(); onEdit(item) }} className={`absolute select-none overflow-hidden rounded-2xl bg-white shadow-[0_12px_40px_rgba(21,28,45,.12)] transition-[box-shadow] ${tool === 'hand' || spacePressed.current ? 'cursor-grab' : 'cursor-move'} ${selectedIds.includes(item.id) ? 'ring-[3px] ring-violet-500 shadow-[0_18px_55px_rgba(124,58,237,.2)]' : 'ring-1 ring-black/5 hover:ring-black/10'}`} style={{ left: item.x, top: item.y, width: item.width }}>
         <div className="flex aspect-square items-center justify-center bg-[#f1f2f6]"><img src={item.src} draggable={false} className="h-full w-full object-contain" /></div>
         <div className="border-t border-slate-100 bg-white px-4 py-3"><p className="line-clamp-2 text-xs leading-5 text-slate-500">{item.prompt}</p></div>
       </article>)}
     </div>
+    {imageMenu && <div className="absolute inset-0 z-40" onPointerDown={event => { event.stopPropagation(); setImageMenu(undefined) }}>
+      <div className="absolute w-40 rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl shadow-slate-900/15" style={{ left: imageMenu.x, top: imageMenu.y }} onPointerDown={event => event.stopPropagation()}>
+        <button onClick={() => { onSelect([imageMenu.item.id]); onEdit(imageMenu.item); setImageMenu(undefined) }} className="flex h-9 w-full items-center gap-2.5 rounded-lg px-3 text-left text-xs text-slate-700 hover:bg-violet-50 hover:text-violet-700"><Pencil className="h-3.5 w-3.5 text-slate-400" />编辑</button>
+        <button onClick={() => { onSelect([imageMenu.item.id]); onDelete(imageMenu.item); setImageMenu(undefined) }} className="flex h-9 w-full items-center gap-2.5 rounded-lg px-3 text-left text-xs text-red-600 hover:bg-red-50"><Trash2 className="h-3.5 w-3.5" />删除</button>
+      </div>
+    </div>}
     {marquee && <div className="pointer-events-none absolute border border-violet-500 bg-violet-500/10" style={marquee} />}
     {!items.length && <div className="pointer-events-none absolute inset-0 flex items-center justify-center"><div className="pointer-events-auto max-w-sm rounded-3xl border border-slate-200/80 bg-white/90 px-10 py-9 text-center shadow-[0_20px_70px_rgba(31,41,55,.09)] backdrop-blur"><div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-violet-50 text-violet-600"><Hand className="h-6 w-6" /></div><h2 className="text-lg font-semibold text-slate-900">这是一张无限画布</h2><p className="mt-2 text-sm leading-6 text-slate-500">滚动平移，⌘ 滚轮缩放，按住 Space 拖动画布。像在 Figma 中一样操作。</p><Button variant="outline" className="mt-5" onClick={onUpload}>上传参考图</Button></div></div>}
 

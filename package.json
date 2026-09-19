@@ -1,8 +1,9 @@
 {
   "name": "lumina-ai-design-studio",
+  "productName": "AI设计助手",
   "version": "1.0.0",
   "private": true,
-  "description": "Electron AI image generation and editing studio",
+  "description": "AI 图片生成、编辑与无限画布工作台",
   "main": "out/main/main.js",
   "type": "module",
   "scripts": {

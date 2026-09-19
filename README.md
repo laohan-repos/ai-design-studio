@@ -1,4 +1,4 @@
-# Lumina AI Studio
+# AI设计助手
 
 基于 Electron、React、TypeScript 和 shadcn/ui 风格组件构建的本地 AI 生图与图片编辑应用。
 
