@@ -117,56 +117,6 @@ npm run preview
 
 没有配置模型时，上传图片、无限画布和本地基础编辑仍然可以使用。
 
-## 模型接口要求
-
-自定义服务需要兼容以下接口：
-
-```text
-GET  /models
-POST /images/generations
-POST /images/edits
-```
-
-文生图使用 JSON 请求。图生图使用 `multipart/form-data`，参考图片字段为 `image[]`。
-
-响应可以返回 Base64 图片：
-
-```json
-{
-  "data": [
-    { "b64_json": "..." }
-  ]
-}
-```
-
-也可以返回图片 URL，应用会在 Electron 主进程中下载并转换为本地数据。
-
-> 不要把 API Key 提交到 Git。模型密钥保存在 Electron 用户数据目录中的本地数据库内。
-
-## 项目结构
-
-```text
-ai-design-studio/
-├── docs/
-│   ├── 需求文档.md
-│   └── design/                 # 真实运行 UI 设计稿
-├── electron/
-│   ├── main.ts                 # 窗口、IPC、AI 请求和文件导出
-│   ├── preload.ts              # 安全的渲染进程桥接接口
-│   └── database.ts             # SQLite 持久化
-├── src/
-│   ├── components/
-│   │   ├── InfiniteCanvas.tsx  # 无限画布
-│   │   ├── ImageEditor.tsx     # 图片编辑与版本管理
-│   │   ├── ModelDialog.tsx     # 模型配置
-│   │   └── ui/                 # 通用 UI 组件
-│   ├── App.tsx                 # 应用布局与业务编排
-│   ├── index.css               # 主题和全局样式
-│   └── types.ts                # 公共 TypeScript 类型
-├── package.json
-└── electron.vite.config.ts
-```
-
 ## 推荐的 Vibe Coding 流程
 
 1. 阅读 [需求文档](./docs/需求文档.md) 中对应模块的功能和验收标准。
