@@ -1,25 +1,31 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain } from 'electron'
 import { join, extname } from 'path'
 import { readFile, writeFile } from 'fs/promises'
+import { productName } from '../package.json'
+import appIcon from '../src/assets/chutu-app-icon.png?asset'
 import { StudioDatabase } from './database'
-
-type ModelConfig = {
-  id: string; name: string; provider: 'constreet' | 'compatible'; baseUrl: string;
-  apiKey: string; model: string; taskType: 'text-to-image' | 'image-to-image'
-}
+import { apiRoot, imageEndpoint, normalizeModelConfig, proxyRules } from '../src/lib/models'
+import { fetchModel, ModelNetworkError, suggestLocalModelProxy } from './model-network'
+import { prepareCanvasGeneration } from './canvas-generation'
+import { LocalMcp } from './local-mcp'
+import { createStudioMcpTools } from './mcp-tools'
+import { PosterService } from './poster-service'
+import { createPortraitRetouch } from './retouch-service'
+import type { PosterOutput } from '../src/lib/poster'
+import type { CanvasGeneration, GeneratePayload, McpWorkspaceChange, ModelConfig } from '../src/types'
 
 const onePerTask = (models: ModelConfig[]) => (['text-to-image', 'image-to-image'] as const).map(taskType => models.find(model => model.taskType === taskType)).filter((model): model is ModelConfig => Boolean(model))
-const apiRoot = (value: string) => value.trim().replace(/\/$/, '').replace(/\/images\/(?:generations|edits)$/i, '').replace(/\/models$/i, '')
-const imageEndpoint = (value: string, action: 'generations' | 'edits') => `${apiRoot(value)}/images/${action}`
-const withFullEndpoint = (model: ModelConfig): ModelConfig => ({ ...model, baseUrl: imageEndpoint(model.baseUrl, model.taskType === 'text-to-image' ? 'generations' : 'edits') })
 
 // Keep using the existing data directory after the user-facing product rename.
+app.setName(productName)
 app.setPath('userData', join(app.getPath('appData'), 'lumina-ai-design-studio'))
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) app.quit()
 
 async function createWindow() {
   const win = new BrowserWindow({
-    width: 1440, height: 920, minWidth: 1080, minHeight: 720,
-    title: 'AI设计助手', titleBarStyle: 'hiddenInset', backgroundColor: '#f8fafc',
+    width: 1440, height: 920, minWidth: 320, minHeight: 460,
+    title: productName, icon: appIcon, titleBarStyle: 'hiddenInset', backgroundColor: '#f8fafc',
     webPreferences: {
       preload: join(__dirname, '../preload/preload.cjs'),
       contextIsolation: true,
@@ -33,7 +39,8 @@ async function createWindow() {
   else await win.loadFile(join(__dirname, '../../out/renderer/index.html'))
 }
 
-app.whenReady().then(async () => {
+if (isPrimaryInstance) void app.whenReady().then(async () => {
+  app.dock?.setIcon(appIcon)
   const database = await StudioDatabase.open(join(app.getPath('userData'), 'lumina-studio.db'))
   if (!database.listModels().length) {
     try {
@@ -42,11 +49,52 @@ app.whenReady().then(async () => {
     } catch { /* no legacy configuration */ }
   }
   const storedModels = database.listModels()
-  const uniqueModels = onePerTask(storedModels).map(withFullEndpoint)
+  const uniqueModels = onePerTask(storedModels).map(normalizeModelConfig)
   if (uniqueModels.length !== storedModels.length || uniqueModels.some((model, index) => model.baseUrl !== storedModels[index]?.baseUrl)) await database.saveModels(uniqueModels)
+  const prepareGeneration = (input: CanvasGeneration) => prepareCanvasGeneration(database, generateImage, input)
+  const publish = (change: McpWorkspaceChange) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (window.isDestroyed() || window.webContents.isDestroyed()) continue
+      try { window.webContents.send('mcp:workspace-changed', change) }
+      catch { /* A window can close after the data has been saved. */ }
+    }
+  }
+  const posters = new PosterService(database, join(app.getPath('downloads'), 'AI设计助手'), poster => publish({ type: 'poster_updated', poster }))
+  const retouch = createPortraitRetouch(database, publish)
+  const applyVersion = async (artworkId: string, versionId: string) => {
+    const result = await database.applyArtworkVersion(artworkId, versionId)
+    if (!result) throw new Error('找不到指定的图片版本')
+    publish({ type: 'artwork_version_applied', result })
+    return result.version
+  }
+  const mcp = new LocalMcp(join(app.getPath('userData'), 'mcp-settings.json'), createStudioMcpTools(database, prepareGeneration, publish, posters, { retouch, applyVersion }))
+  ipcMain.handle('portrait:retouch', (_e, input: unknown) => retouch(input))
+  ipcMain.handle('poster:open', (_e, id: string, versionId?: string) => posters.open(id, versionId))
+  ipcMain.handle('poster:edit', (_e, input: unknown) => posters.edit(input))
+  ipcMain.handle('poster:undo', (_e, id: string, revision: number) => posters.undo(id, revision))
+  ipcMain.handle('poster:preview', (_e, id: string, size: PosterOutput['size']) => posters.preview(id, size))
+  ipcMain.handle('poster:source', async (_e, id: string) => {
+    const source = await posters.previewSource(id, posters.get(id).sourceVersionId)
+    return `data:image/png;base64,${source.toString('base64')}`
+  })
+  ipcMain.handle('poster:export', (_e, id: string, options: PosterOutput) => posters.export(id, options))
+  app.on('before-quit', () => { void mcp.close() })
+  ipcMain.handle('mcp:status', () => mcp.getStatus())
+  ipcMain.handle('mcp:set-enabled', (_e, enabled: unknown) => {
+    if (typeof enabled !== 'boolean') throw new Error('无效的 MCP 服务状态')
+    return mcp.setEnabled(enabled)
+  })
+  ipcMain.handle('mcp:copy-connection', async (_e, format: unknown) => {
+    const { url, token } = await mcp.getConnection()
+    if (format === 'token') clipboard.writeText(token)
+    else if (format === 'codex') clipboard.writeText(`[mcp_servers.ai_design_studio]\nurl = "${url}"\nhttp_headers = { Authorization = "Bearer ${token}" }\n`)
+    else throw new Error('无效的连接配置格式')
+  })
   ipcMain.handle('models:list', () => database.listModels())
   ipcMain.handle('models:save', async (_e, models: ModelConfig[]) => {
-    await database.saveModels(onePerTask(models).map(withFullEndpoint))
+    const normalized = onePerTask(models).map(normalizeModelConfig)
+    normalized.forEach(model => { if (model.provider === 'openai' && model.proxyEnabled) proxyRules(model.proxyUrl || '') })
+    await database.saveModels(normalized)
     return true
   })
   ipcMain.handle('model:test', async (_e, model: ModelConfig) => testModelConnection(model))
@@ -56,11 +104,16 @@ app.whenReady().then(async () => {
   ipcMain.handle('artworks:list', (_e, canvasId: string) => database.listArtworks(canvasId))
   ipcMain.handle('artworks:save', async (_e, artworks) => { await database.saveArtworks(artworks); return true })
   ipcMain.handle('artworks:move', async (_e, id: string, x: number, y: number) => { await database.moveArtwork(id, x, y); return true })
-  ipcMain.handle('artworks:delete', async (_e, id: string) => { await database.deleteArtwork(id); return true })
+  ipcMain.handle('artworks:delete', async (_e, id: string) => {
+    const result = await database.deleteArtwork(id)
+    publish({ type: 'artwork_deleted', ...result })
+    return true
+  })
   ipcMain.handle('artwork-versions:list', (_e, artworkId: string) => database.listArtworkVersions(artworkId))
-  ipcMain.handle('artwork-versions:save', async (_e, version) => { await database.saveArtworkVersion(version); return true })
-  ipcMain.handle('artwork-versions:apply', (_e, artworkId: string, versionId: string) => database.applyArtworkVersion(artworkId, versionId))
+  ipcMain.handle('artwork-versions:save', (_e, version) => database.saveArtworkVersion(version))
+  ipcMain.handle('artwork-versions:apply', (_e, artworkId: string, versionId: string) => applyVersion(artworkId, versionId))
   ipcMain.handle('image:generate', async (_e, payload) => generateImage(payload))
+  ipcMain.handle('canvas:generate-artwork', (_e, input: CanvasGeneration) => prepareGeneration(input)())
   ipcMain.handle('image:save', async (_e, dataUrl: string, suggestedName: string) => {
     const extension = extname(suggestedName) || '.png'
     const result = await dialog.showSaveDialog({ defaultPath: suggestedName, filters: [{ name: '图片', extensions: [extension.slice(1)] }] })
@@ -71,15 +124,22 @@ app.whenReady().then(async () => {
   })
   createWindow()
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
+  app.on('second-instance', () => {
+    const window = BrowserWindow.getAllWindows()[0]
+    if (!window) { void createWindow(); return }
+    if (window.isMinimized()) window.restore()
+    window.focus()
+  })
 })
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
 
 async function testModelConnection(config: ModelConfig) {
+  config = normalizeModelConfig(config)
   if (!config.apiKey.trim()) return { ok: false, modelFound: false, message: '请先填写 API Key' }
   const startedAt = Date.now()
   try {
     const endpoint = `${apiRoot(config.baseUrl)}/models`
-    const response = await fetch(endpoint, { headers: { Authorization: `Bearer ${config.apiKey}` }, signal: AbortSignal.timeout(15_000) })
+    const response = await fetchModel(config, endpoint, { headers: { Authorization: `Bearer ${config.apiKey}` }, signal: AbortSignal.timeout(15_000) })
     const raw = await response.text()
     if (!response.ok) {
       let message = raw
@@ -91,28 +151,37 @@ async function testModelConnection(config: ModelConfig) {
     const modelFound = models.some(item => item.id === config.model)
     return { ok: true, modelFound, latencyMs: Date.now() - startedAt, message: modelFound ? `连接成功，已找到 ${config.model}` : `连接成功，但模型列表中未找到 ${config.model}` }
   } catch (error) {
-    const isTimeout = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
-    return { ok: false, modelFound: false, message: isTimeout ? '连接超时，请检查网络或 API 地址' : `无法连接：${error instanceof Error ? error.message : '未知错误'}` }
+    if (error instanceof ModelNetworkError) {
+      const proxySuggestion = config.provider === 'openai' && !config.proxyEnabled ? suggestLocalModelProxy() : undefined
+      return { ok: false, modelFound: false, message: error.message, proxySuggestion }
+    }
+    return { ok: false, modelFound: false, message: error instanceof Error ? error.message : '无法连接模型服务' }
   }
 }
 
-async function generateImage(payload: { config: ModelConfig; prompt: string; size: string; count: number; quality: 'low' | 'medium' | 'high'; image?: string }) {
-  const { config, prompt, size, count, quality, image } = payload
-  const endpoint = imageEndpoint(config.baseUrl, image ? 'edits' : 'generations')
+async function generateImage(payload: GeneratePayload) {
+  const { prompt, size, count, quality, image } = payload
+  const config = normalizeModelConfig(payload.config)
+  if (!config.apiKey) throw new Error('请先在模型配置中填写 API Key')
+  if (!config.model) throw new Error('请先在模型配置中填写模型 ID')
+  const endpoint = imageEndpoint(config.baseUrl, image ? 'image-to-image' : 'text-to-image')
   let body: BodyInit
   let headers: Record<string, string> = { Authorization: `Bearer ${config.apiKey}` }
   if (image) {
     const form = new FormData()
     form.append('model', config.model); form.append('prompt', prompt); form.append('size', size); form.append('quality', quality); form.append('n', String(count))
-    const [meta, content] = image.split(',')
-    const mime = meta.match(/data:(.*?);/)?.[1] || 'image/png'
-    form.append('image[]', new Blob([Buffer.from(content, 'base64')], { type: mime }), 'reference.png')
+    const match = image.match(/^data:(image\/[\w.+-]+);base64,(.+)$/)
+    if (!match) throw new Error('参考图片格式无效，请重新上传图片')
+    const [, mime, content] = match
+    const extensions: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }
+    if (config.provider === 'openai' && !extensions[mime]) throw new Error('OpenAI 图片编辑支持 PNG、JPEG 和 WebP 参考图片，请转换格式后重试')
+    form.append('image[]', new Blob([Buffer.from(content, 'base64')], { type: mime }), `reference.${extensions[mime] || 'png'}`)
     body = form
   } else {
     headers['Content-Type'] = 'application/json'
     body = JSON.stringify({ model: config.model, prompt, size, quality, n: count })
   }
-  const response = await fetch(endpoint, { method: 'POST', headers, body, signal: AbortSignal.timeout(600_000) })
+  const response = await fetchModel(config, endpoint, { method: 'POST', headers, body, signal: AbortSignal.timeout(600_000) })
   const raw = await response.text()
   if (!response.ok) {
     let message = raw
@@ -121,11 +190,12 @@ async function generateImage(payload: { config: ModelConfig; prompt: string; siz
   }
   const json = JSON.parse(raw)
   const items = json.data || json.images || []
+  if (!Array.isArray(items) || !items.length) throw new Error('模型没有返回可用图片，请检查模型 ID 和服务配置')
   return Promise.all(items.map(async (item: any) => {
     const b64 = item.b64_json || item.base64
     if (b64) return `data:image/png;base64,${b64}`
     if (item.url) {
-      const remote = await fetch(item.url)
+      const remote = await fetchModel(config, item.url, { signal: AbortSignal.timeout(600_000) })
       if (!remote.ok) throw new Error('生成成功，但下载图片失败')
       const mime = remote.headers.get('content-type') || 'image/png'
       return `data:${mime};base64,${Buffer.from(await remote.arrayBuffer()).toString('base64')}`

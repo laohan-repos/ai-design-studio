@@ -1,10 +1,10 @@
-# AI设计助手
+# 出图
 
 一款本地优先的桌面 AI 图片创作工具，支持多无限画布、文生图、图生图、图片编辑和版本管理。
 
 > 这个仓库已经准备好用于 Vibe Coding。开始开发前，请先运行项目，再阅读需求文档并对照真实 UI 设计稿，不要只根据文字重新想象界面。
 
-![AI设计助手真实运行主界面](./docs/design/01-主界面.png)
+![主界面交互参考](./docs/design/01-主界面.png)
 
 ## Vibe Coding 入口
 
@@ -46,7 +46,9 @@
 ### AI 图片生成
 
 - 文生图和图生图使用两套独立模型配置。
-- 支持 OpenAI 图片接口及兼容服务。
+- 内置 OpenAI 官方服务预设，也支持 Constreet 和自定义 OpenAI 兼容服务。
+- 选择 OpenAI 官方后自动填入接口地址，模型 ID 支持建议列表和手动输入。
+- OpenAI 官方服务支持可选的 HTTP、HTTPS、SOCKS5 网络代理；连接测试、图片生成、图片编辑及结果下载共用对应模型的代理配置。
 - 支持正方形、横图和竖图尺寸。
 - 支持 `low`、`medium`、`high` 三档质量。
 - 模型配置支持连接测试，可检查 API Key、网络和目标模型。
@@ -111,11 +113,43 @@ npm run preview
 1. 启动应用。
 2. 点击右上角“模型配置”。
 3. 分别配置文生图模型和图片编辑模型。
+   - 使用官方服务时，服务类型选择“OpenAI 官方”，填写自己的 OpenAI API Key；接口地址自动填入，模型 ID 可按账户权限修改。
+   - 默认使用 `gpt-image-2.6-flare`，支持的模型与参数可查看 [OpenAI 图片生成文档](https://developers.openai.com/api/docs/guides/image-generation)。
+   - 如需网络代理，在对应模型下勾选“使用代理”，填写完整地址，例如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`。代理程序需要已启动，当前支持无需用户名和密码的代理。关闭后直连，文生图和图生图分别保存设置。
 4. 使用“连接测试”检查 API 地址、API Key 和模型名称。
 5. 新建无限画布。
 6. 通过画布右键菜单生成或上传第一张图片。
 
 没有配置模型时，上传图片、无限画布和本地基础编辑仍然可以使用。
+
+## 用本机 Agent 操作画布
+
+1. 打开桌面应用，点击顶部 **MCP → 启动服务**。服务地址为 `http://127.0.0.1:38473/mcp`。
+2. 使用 Codex 时，点击 **复制 Codex 配置**，粘贴到用户级 `~/.codex/config.toml`，重新加载 Codex。其他支持 Streamable HTTP 的客户端可使用上面的地址，并在 `Authorization` 请求头填入 `Bearer <MCP 访问令牌>`。
+3. 试着对 Agent 说「列出出图里的画布」，或者「在『夏季新品』画布生成一张 3:2 的商品海报」。
+
+- 用 `list_canvases` 查画布，用 `create_canvas` 新建，用 `rename_canvas` 重命名。
+- 用 `list_artworks` 查画布里的图片，用 `move_artwork` 设置图片左上角的画布坐标 `x` 和 `y`。支持负坐标。
+- 用 `delete_artwork` 或 `delete_canvas` 永久删除。两项工具都需要 `confirm: true`，会删除对应图片的历史版本和分层海报。删除画布会一并删除其中的所有图片。
+- 用 `generate_image` 按应用保存的文生图模型和代理生成一张图片，再用 `get_image_job` 查询结果。生成成功后，图片会自动显示在目标画布。重试同一次提交时复用 `requestId`，可以避免重复生成。
+
+MCP 仅供本机使用，需保持应用运行。服务开关和访问令牌会在下次启动时恢复，任务状态仅在当前进程保留。停止 MCP 服务后，已提交的任务仍会继续执行。请把复制的访问令牌保存在客户端的本地配置中。
+
+## 分层海报
+
+双击画布里的图片，在图片编辑器中打开「分层海报」。主体、背景、接触阴影和文字可分别调整。纯色背景可通过边缘颜色去除，复杂背景可沿主体边缘手动描边。每张图片对应一份海报文档，首次创建时绑定选中的原图版本。修改会自动保存，支持撤销最近 20 次编辑。
+
+Agent 可用 `get_artwork_preview` 看原图，用 `open_poster` 创建或打开文档，按返回的 `revision` 通过 `edit_poster` 修改图层。用 `preview_poster` 检查排版，用 `undo_poster_edit` 撤销上一步，用 `export_poster` 导出。支持 PNG 和 JPEG，可导出当前尺寸、1080 × 1080 方图或 1080 × 1620 竖图，文件保存到本机下载目录中的「AI设计助手」。
+
+可以对 Agent 说「用画布上的商品图做一张海报。抠掉白底，换成暖灰背景，加接触阴影，标题写『夏日限定』，价格写『¥ 99』，先预览，再导出方图和竖图。」
+
+## 用 Agent 给人像磨皮
+
+图片编辑器提供「人像磨皮」，支持调整磨皮、提亮强度和处理范围。也可以请 Codex 先看预览，按肤质、光线和用户要求决定强度，再调用 `retouch_portrait`。合照可以处理所有人脸、主要人脸，或框选要处理的人脸。
+
+磨皮和人脸定位在本机执行，结果保存为新版本。Agent 可用 `get_artwork_preview` 传入版本 ID 检查结果，确认后用 `apply_artwork_version` 应用到画布。让 Codex 看图时，预览缩略图会通过 MCP 返回给 Codex。
+
+人脸定位使用 [OpenCV Zoo 的 YuNet 模型](https://github.com/opencv/opencv_zoo/tree/47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet)，MIT 许可证随模型保存在 `electron/assets/yunet`。
 
 ## 推荐的 Vibe Coding 流程
 
@@ -162,4 +196,4 @@ npm run preview
 lumina-studio.db
 ```
 
-数据库位于 Electron 的用户数据目录。为了兼容旧版本，产品改名为“AI设计助手”后仍沿用原来的 `lumina-ai-design-studio` 数据目录；旧版 `models.json` 会在首次启动时自动迁移。
+数据库位于 Electron 用户数据目录中的 `lumina-ai-design-studio`，供出图和旧版本使用。旧版 `models.json` 会在首次启动时自动迁移。

@@ -11,6 +11,7 @@ type Interaction =
   | { type: 'pan'; sx: number; sy: number; x: number; y: number }
   | { type: 'marquee'; sx: number; sy: number; cx: number; cy: number }
   | { type: 'nodes'; sx: number; sy: number; origins: Record<string, Point> }
+  | { type: 'pinch'; distance: number; zoom: number; focusX: number; focusY: number }
 
 type Props = {
   items: CanvasImage[]
@@ -30,9 +31,12 @@ const nodeHeight = (item: CanvasImage) => item.width + 72
 export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onMove, onMoveEnd, onEdit, onDelete, onUpload }: Props) {
   const host = useRef<HTMLDivElement>(null)
   const interaction = useRef<Interaction>()
+  const touches = useRef(new Map<number, Point>())
   const spacePressed = useRef(false)
   const [view, setView] = useState<Viewport>({ x: 120, y: 90, zoom: 1 })
   const viewRef = useRef(view)
+  const itemsRef = useRef(items)
+  const initialFrame = useRef(false)
   const [tool, setTool] = useState<Tool>('select')
   const [panning, setPanning] = useState(false)
   const [, forceCursor] = useState(0)
@@ -45,7 +49,9 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
     const minX = Math.min(...targets.map(i => i.x)); const minY = Math.min(...targets.map(i => i.y))
     const maxX = Math.max(...targets.map(i => i.x + i.width)); const maxY = Math.max(...targets.map(i => i.y + nodeHeight(i)))
     const contentW = Math.max(1, maxX - minX); const contentH = Math.max(1, maxY - minY)
-    const zoom = clamp(Math.min((rect.width - 160) / contentW, (rect.height - 160) / contentH), .15, maxZoom)
+    const marginX = clamp(rect.width * .14, 24, 160)
+    const marginY = clamp(rect.height * .23, 54, 160)
+    const zoom = clamp(Math.min((rect.width - marginX) / contentW, (rect.height - marginY) / contentH), .05, maxZoom)
     setView({ x: (rect.width - contentW * zoom) / 2 - minX * zoom, y: (rect.height - contentH * zoom) / 2 - minY * zoom, zoom })
   }, [])
   const fitAll = useCallback(() => {
@@ -69,7 +75,32 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
     }))
   }, [focusArtwork?.sequence])
 
-  useEffect(() => { if (items.length === 1) requestAnimationFrame(fitAll) }, [items.length, fitAll])
+  useEffect(() => {
+    itemsRef.current = items
+    if (!initialFrame.current && items.length) {
+      initialFrame.current = true
+      if (items.length === 1 || window.innerWidth < 768) frameBounds(items)
+    }
+  }, [items, frameBounds])
+
+  useEffect(() => {
+    const node = host.current
+    if (!node) return
+    let previousWidth = node.clientWidth
+    let previousHeight = node.clientHeight
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect
+      const dx = width - previousWidth, dy = height - previousHeight
+      previousWidth = width
+      previousHeight = height
+      if (!dx && !dy) return
+      setImageMenu(undefined)
+      if (window.innerWidth < 768 && itemsRef.current.length) frameBounds(itemsRef.current)
+      else setView(current => ({ ...current, x: current.x + dx / 2, y: current.y + dy / 2 }))
+    })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [frameBounds])
   useEffect(() => {
     const editable = (target: EventTarget | null) => target instanceof HTMLElement && (target.matches('input, textarea, select') || target.isContentEditable)
     const down = (event: KeyboardEvent) => {
@@ -91,7 +122,7 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
 
   const zoomAtCenter = (factor: number) => {
     const rect = host.current?.getBoundingClientRect(); if (!rect) return
-    setView(v => { const next = clamp(v.zoom * factor, .1, 4); const cx = rect.width / 2; const cy = rect.height / 2; return { x: cx - (cx - v.x) * next / v.zoom, y: cy - (cy - v.y) * next / v.zoom, zoom: next } })
+    setView(v => { const next = clamp(v.zoom * factor, .05, 4); const cx = rect.width / 2; const cy = rect.height / 2; return { x: cx - (cx - v.x) * next / v.zoom, y: cy - (cy - v.y) * next / v.zoom, zoom: next } })
   }
   useEffect(() => {
     const node = host.current; if (!node) return
@@ -99,7 +130,7 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
       event.preventDefault()
       const rect = node.getBoundingClientRect(); const current = viewRef.current
       if (event.ctrlKey || event.metaKey) {
-        const next = clamp(current.zoom * Math.exp(-event.deltaY * .006), .1, 4)
+        const next = clamp(current.zoom * Math.exp(-event.deltaY * .006), .05, 4)
         const px = event.clientX - rect.left; const py = event.clientY - rect.top
         setView({ x: px - (px - current.x) * next / current.zoom, y: py - (py - current.y) * next / current.zoom, zoom: next })
       } else if (event.shiftKey && !event.deltaX) setView(v => ({ ...v, x: v.x - event.deltaY }))
@@ -108,12 +139,46 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
     node.addEventListener('wheel', wheel, { passive: false })
     return () => node.removeEventListener('wheel', wheel)
   }, [])
+
+  const pinchPoints = () => {
+    const [first, second] = touches.current.values()
+    const rect = host.current?.getBoundingClientRect()
+    if (!first || !second || !rect) return
+    return {
+      x: (first.x + second.x) / 2 - rect.left,
+      y: (first.y + second.y) / 2 - rect.top,
+      distance: Math.max(1, Math.hypot(first.x - second.x, first.y - second.y))
+    }
+  }
+  const beginPinch = () => {
+    const points = pinchPoints()
+    if (!points) return false
+    const active = interaction.current
+    if (active?.type === 'nodes') onMove(Object.entries(active.origins).map(([id, origin]) => ({ id, ...origin })))
+    const current = viewRef.current
+    interaction.current = {
+      type: 'pinch', distance: points.distance, zoom: current.zoom,
+      focusX: (points.x - current.x) / current.zoom, focusY: (points.y - current.y) / current.zoom
+    }
+    setMarquee(undefined)
+    setPanning(true)
+    return true
+  }
+  const registerTouch = (event: React.PointerEvent) => {
+    if (event.pointerType !== 'touch') return false
+    touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    host.current?.setPointerCapture(event.pointerId)
+    return beginPinch()
+  }
+
   const beginPan = (event: React.PointerEvent) => {
     event.preventDefault()
     host.current?.setPointerCapture(event.pointerId); setPanning(true)
     interaction.current = { type: 'pan', sx: event.clientX, sy: event.clientY, x: view.x, y: view.y }
   }
   const startCanvas = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (registerTouch(event)) return
+    if (event.pointerType === 'touch') { onSelect([]); beginPan(event); return }
     if (event.button === 1 || spacePressed.current || tool === 'hand') { beginPan(event); return }
     if (event.button !== 0) return
     const rect = host.current!.getBoundingClientRect(); const sx = event.clientX - rect.left; const sy = event.clientY - rect.top
@@ -123,6 +188,10 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
     setMarquee({ left: sx, top: sy, width: 0, height: 0 })
   }
   const startNode = (event: React.PointerEvent, item: CanvasImage) => {
+    if (event.pointerType === 'touch') {
+      event.stopPropagation()
+      if (registerTouch(event)) return
+    }
     if (event.button === 1 || spacePressed.current || tool === 'hand') { event.stopPropagation(); beginPan(event); return }
     if (event.button !== 0) return
     event.stopPropagation()
@@ -134,7 +203,18 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
     interaction.current = { type: 'nodes', sx: event.clientX, sy: event.clientY, origins: Object.fromEntries(items.filter(candidate => next.includes(candidate.id)).map(candidate => [candidate.id, { x: candidate.x, y: candidate.y }])) }
   }
   const move = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === 'touch') {
+      if (!touches.current.has(event.pointerId)) return
+      touches.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    }
     const active = interaction.current; if (!active) return
+    if (active.type === 'pinch') {
+      const points = pinchPoints()
+      if (!points) return
+      const zoom = clamp(active.zoom * points.distance / active.distance, .05, 4)
+      setView({ x: points.x - active.focusX * zoom, y: points.y - active.focusY * zoom, zoom })
+      return
+    }
     if (active.type === 'pan') setView(v => ({ ...v, x: active.x + event.clientX - active.sx, y: active.y + event.clientY - active.sy }))
     if (active.type === 'nodes') onMove(Object.entries(active.origins).map(([id, origin]) => ({ id, x: origin.x + (event.clientX - active.sx) / view.zoom, y: origin.y + (event.clientY - active.sy) / view.zoom })))
     if (active.type === 'marquee') {
@@ -145,7 +225,21 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
   }
   const end = (event: React.PointerEvent<HTMLDivElement>) => {
     const active = interaction.current
-    if (active?.type === 'nodes') onMoveEnd(Object.entries(active.origins).map(([id, origin]) => ({ id, x: origin.x + (event.clientX - active.sx) / view.zoom, y: origin.y + (event.clientY - active.sy) / view.zoom })))
+    if (event.pointerType === 'touch') {
+      if (!touches.current.delete(event.pointerId)) return
+      if (active?.type === 'pinch' && touches.current.size) {
+        if (beginPinch()) return
+        const [remaining] = touches.current.values()
+        const current = viewRef.current
+        interaction.current = { type: 'pan', sx: remaining.x, sy: remaining.y, x: current.x, y: current.y }
+        return
+      }
+    }
+    if (active?.type === 'nodes') {
+      const dx = event.clientX - active.sx, dy = event.clientY - active.sy
+      if (event.type === 'pointercancel' || (!dx && !dy)) onMove(Object.entries(active.origins).map(([id, origin]) => ({ id, ...origin })))
+      else onMoveEnd(Object.entries(active.origins).map(([id, origin]) => ({ id, x: origin.x + dx / view.zoom, y: origin.y + dy / view.zoom })))
+    }
     if (active?.type === 'marquee') {
       const left = (Math.min(active.sx, active.cx) - view.x) / view.zoom; const top = (Math.min(active.sy, active.cy) - view.y) / view.zoom
       const right = (Math.max(active.sx, active.cx) - view.x) / view.zoom; const bottom = (Math.max(active.sy, active.cy) - view.y) / view.zoom
@@ -164,8 +258,8 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
     onSelect([item.id])
     setImageMenu({
       item,
-      x: Math.min(event.clientX - rect.left, rect.width - 176),
-      y: Math.min(event.clientY - rect.top, rect.height - 56)
+      x: Math.max(0, Math.min(event.clientX - rect.left, rect.width - 176)),
+      y: Math.max(0, Math.min(event.clientY - rect.top, rect.height - 88))
     })
   }
 
@@ -184,13 +278,13 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
       </div>
     </div>}
     {marquee && <div className="pointer-events-none absolute border border-violet-500 bg-violet-500/10" style={marquee} />}
-    {!items.length && <div className="pointer-events-none absolute inset-0 flex items-center justify-center"><div className="pointer-events-auto max-w-sm rounded-3xl border border-slate-200/80 bg-white/90 px-10 py-9 text-center shadow-[0_20px_70px_rgba(31,41,55,.09)] backdrop-blur"><div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-violet-50 text-violet-600"><Hand className="h-6 w-6" /></div><h2 className="text-lg font-semibold text-slate-900">这是一张无限画布</h2><p className="mt-2 text-sm leading-6 text-slate-500">滚动平移，⌘ 滚轮缩放，按住 Space 拖动画布。像在 Figma 中一样操作。</p><Button variant="outline" className="mt-5" onClick={onUpload}>上传参考图</Button></div></div>}
+    {!items.length && <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-3"><div className="pointer-events-auto max-w-sm rounded-3xl border border-slate-200/80 bg-white/90 px-5 py-4 text-center shadow-[0_20px_70px_rgba(31,41,55,.09)] backdrop-blur md:px-10 md:py-9" onPointerDown={event => event.stopPropagation()}><div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-violet-50 text-violet-600 md:mb-5 md:h-14 md:w-14"><Hand className="h-5 w-5 md:h-6 md:w-6" /></div><h2 className="text-base font-semibold text-slate-900 md:text-lg">这是一张无限画布</h2><p className="mt-2 text-xs leading-5 text-slate-500 md:text-sm md:leading-6"><span className="md:hidden">拖动空白处平移，双指捏合或用下方按钮缩放。</span><span className="hidden md:inline">滚动平移，⌘ 滚轮缩放，按住 Space 拖动画布。</span></p><Button variant="outline" className="mt-3 md:mt-5" onClick={onUpload}>上传参考图</Button></div></div>}
 
-    <div className="absolute left-4 top-4 flex items-center gap-1 rounded-xl border border-slate-200 bg-white p-1.5 shadow-lg" onPointerDown={event => event.stopPropagation()}>
+    <div className="absolute left-2 top-2 flex items-center gap-1 rounded-xl border border-slate-200 bg-white p-1 shadow-lg md:left-4 md:top-4 md:p-1.5" onPointerDown={event => event.stopPropagation()}>
       <Button variant={tool === 'select' ? 'secondary' : 'ghost'} size="icon" onClick={() => setTool('select')} title="选择工具 (V)"><MousePointer2 className="h-4 w-4" /></Button>
       <Button variant={tool === 'hand' ? 'secondary' : 'ghost'} size="icon" onClick={() => setTool('hand')} title="抓手工具 (H)"><Hand className="h-4 w-4" /></Button>
     </div>
-    <div className="absolute bottom-5 right-5 flex items-center gap-1 rounded-xl border border-slate-200 bg-white/95 p-1.5 shadow-lg shadow-slate-300/40 backdrop-blur" onPointerDown={event => event.stopPropagation()}>
+    <div className="absolute bottom-2 right-2 flex items-center gap-1 rounded-xl border border-slate-200 bg-white/95 p-1 shadow-lg shadow-slate-300/40 backdrop-blur md:bottom-5 md:right-5 md:p-1.5" onPointerDown={event => event.stopPropagation()}>
       <Button variant="ghost" size="icon" onClick={() => zoomAtCenter(.8)} title="缩小 (-)"><Minus className="h-4 w-4" /></Button>
       <button onClick={() => setView(v => ({ ...v, zoom: 1 }))} className="w-14 text-center text-xs font-medium tabular-nums text-slate-600" title="100% (1)">{Math.round(view.zoom * 100)}%</button>
       <Button variant="ghost" size="icon" onClick={() => zoomAtCenter(1.25)} title="放大 (+)"><Plus className="h-4 w-4" /></Button>
@@ -198,6 +292,6 @@ export function InfiniteCanvas({ items, selectedIds, focusArtwork, onSelect, onM
       <Button variant="ghost" size="icon" onClick={fitAll} title="适配全部 (Shift+1)"><Focus className="h-4 w-4" /></Button>
       <Button variant="ghost" size="icon" onClick={fitSelection} disabled={!selectedIds.length} title="适配选中 (Shift+2)"><Scan className="h-4 w-4" /></Button>
     </div>
-    <div className="pointer-events-none absolute bottom-6 left-4 rounded-lg border border-slate-200 bg-white/85 px-2.5 py-1.5 text-[10px] text-slate-400 shadow-sm"><span className="font-medium text-slate-500">V</span> 选择 · <span className="font-medium text-slate-500">H / Space</span> 抓手 · <span className="font-medium text-slate-500">Shift</span> 多选 · <span className="font-medium text-slate-500">双击</span> 编辑</div>
+    <div className="pointer-events-none absolute bottom-6 left-4 hidden rounded-lg border border-slate-200 bg-white/85 px-2.5 py-1.5 text-[10px] text-slate-400 shadow-sm xl:block"><span className="font-medium text-slate-500">V</span> 选择 · <span className="font-medium text-slate-500">H / Space</span> 抓手 · <span className="font-medium text-slate-500">Shift</span> 多选 · <span className="font-medium text-slate-500">双击</span> 编辑</div>
   </div>
 }

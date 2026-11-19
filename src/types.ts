@@ -1,11 +1,15 @@
+import type { PosterDocument } from './lib/poster'
+
 export type ModelConfig = {
   id: string
   name: string
-  provider: 'constreet' | 'compatible'
+  provider: 'openai' | 'constreet' | 'compatible'
   taskType: 'text-to-image' | 'image-to-image'
   baseUrl: string
   apiKey: string
   model: string
+  proxyEnabled?: boolean
+  proxyUrl?: string
 }
 
 export type GeneratePayload = {
@@ -49,9 +53,36 @@ export type InfiniteCanvasRecord = {
   coverSrc?: string
 }
 
+export type CanvasGeneration = {
+  canvasId: string
+  modelId?: string
+  prompt: string
+  size: string
+  quality: GeneratePayload['quality']
+}
+
+export type GeneratedArtwork = {
+  artwork: Artwork
+  artworkCount: number
+}
+
+export type McpWorkspaceChange =
+  | { type: 'canvas_created'; canvas: InfiniteCanvasRecord }
+  | { type: 'canvas_renamed'; canvasId: string; name: string; updatedAt: number }
+  | { type: 'canvas_deleted'; canvasId: string; nextCanvasId?: string }
+  | { type: 'artwork_created'; result: GeneratedArtwork }
+  | { type: 'artwork_moved'; artworkId: string; canvasId: string; x: number; y: number; updatedAt: number }
+  | { type: 'artwork_deleted'; artworkId: string; canvasId: string; artworkCount: number; updatedAt: number; coverSrc?: string }
+  | { type: 'artwork_versions_changed'; artworkId: string }
+  | { type: 'artwork_version_applied'; result: { version: ArtworkVersion; canvasId: string; isCover: boolean; updatedAt: number } }
+  | { type: 'poster_updated'; poster: PosterDocument }
+
+export type McpStatus = { running: boolean; url: string; error?: string }
+
 export type ModelTestResult = {
   ok: boolean
   modelFound: boolean
   message: string
   latencyMs?: number
+  proxySuggestion?: string
 }
