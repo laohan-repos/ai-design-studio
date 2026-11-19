@@ -10,6 +10,8 @@ interface Window {
     createCanvas(id: string, name: string): Promise<import('./types').InfiniteCanvasRecord>
     renameCanvas(id: string, name: string): Promise<number>
     listArtworks(canvasId: string): Promise<import('./types').Artwork[]>
+    listArtworkGroups(canvasId: string): Promise<import('./lib/canvas-groups').CanvasGrouping>
+    changeArtworkGroups(input: import('./lib/canvas-groups').ArtworkGroupChangeInput): Promise<import('./lib/canvas-groups').CanvasGroupingChange>
     saveArtworks(artworks: import('./types').Artwork[]): Promise<boolean>
     moveArtwork(id: string, x: number, y: number): Promise<boolean>
     deleteArtwork(id: string): Promise<boolean>
@@ -17,12 +19,27 @@ interface Window {
     saveArtworkVersion(version: Omit<import('./types').ArtworkVersion, 'versionNumber' | 'isCurrent'>): Promise<import('./types').ArtworkVersion>
     applyArtworkVersion(artworkId: string, versionId: string): Promise<import('./types').ArtworkVersion | undefined>
     retouchPortrait(input: import('./lib/retouch').RetouchInput): Promise<import('./lib/retouch').RetouchResult>
+    updateEditorContext(context: import('./lib/photo-edits').EditorSelection): void
+    inspectPhoto(input: import('./lib/photo-edits').PhotoView): Promise<import('./lib/photo-edits').PhotoInspection>
+    inspectPhotoColors(input: import('./lib/photo-edits').PhotoColorsView): Promise<import('./lib/photo-edits').PhotoColorInspection>
+    suggestPhotoCrops(input: import('./lib/photo-edits').PhotoCropRequest): Promise<import('./lib/photo-crop').SuggestedPhotoCrops>
+    getPhotoEditRecipe(input: { artworkId: string; versionId: string }): Promise<import('./lib/photo-edits').PhotoEditPlan | null>
+    previewPhotoMask(input: import('./lib/photo-edits').PhotoMaskView): Promise<import('./lib/photo-edits').PhotoInspection>
+    previewPhotoEdit(input: import('./lib/photo-edits').PhotoEditRequest): Promise<import('./lib/photo-edits').PhotoEditPreview>
+    savePhotoEdit(draftId: string): Promise<import('./lib/photo-edits').SavedPhotoEdit>
+    getEditorHistory(artworkId: string): Promise<import('./lib/editor-history').EditorHistory>
+    navigateEditorHistory(artworkId: string, revision: number, cursor: number): Promise<import('./lib/editor-history').EditorHistory>
     generate(payload: import('./types').GeneratePayload): Promise<string[]>
     generateCanvasArtwork(input: import('./types').CanvasGeneration): Promise<import('./types').GeneratedArtwork>
     openPoster(id: string, versionId?: string): Promise<import('./lib/poster').PosterDocument>
     editPoster(input: { artworkId: string; revision: number; operations: import('./lib/poster').PosterOperation[] }): Promise<import('./lib/poster').PosterDocument>
     undoPoster(id: string, revision: number): Promise<import('./lib/poster').PosterDocument>
-    previewPoster(id: string, size?: import('./lib/poster').PosterOutput['size']): Promise<import('./lib/poster').PosterImage>
+    previewPoster(id: string, size?: import('./lib/poster').PosterOutput['size'], transform?: import('./lib/poster').PosterTransformPreview): Promise<import('./lib/poster').PosterImage>
+    getPosterLayerMaskPreview(id: string, layerId: import('./lib/poster').PosterMaskLayerId, revision: number): Promise<import('./lib/poster').PosterLayerMaskPreview>
+    inspectPosterLayerPixels(input: import('./lib/poster-pixels').PosterPixelInput): Promise<import('./lib/poster-pixels').PosterPixelView>
+    paintPosterLayerPixels(input: import('./lib/poster-pixels').PosterPixelPaintInput): Promise<import('./lib/poster').PosterDocument>
+    previewPosterLayerRegion(input: import('./lib/poster-pixels').PosterRegionInput): Promise<import('./lib/poster-pixels').PosterRegionPreview>
+    savePosterLayerRegion(draftId: string): Promise<import('./lib/poster').PosterDocument>
     getPosterSource(id: string): Promise<string>
     exportPoster(id: string, options: import('./lib/poster').PosterOutput): Promise<{ path: string; width: number; height: number; revision: number }>
     getMcpStatus(): Promise<import('./types').McpStatus>

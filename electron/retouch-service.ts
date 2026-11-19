@@ -33,11 +33,13 @@ export function createPortraitRetouch(database: StudioDatabase, publish: (change
   let working = false
   return async (input: unknown): Promise<RetouchResult> => {
     const { artworkId, versionId, ...options } = retouchInput.parse(input)
-    if (!options.smoothing && !options.brighten) throw new Error('请至少选择一项大于零的调整')
+    if (!options.smoothing && !options.brighten && !options.underEyeShadows && !options.cheekTone && !options.dressHighlights) {
+      throw new Error('请至少选择一项大于零的调整')
+    }
     if (working) throw new Error('正在处理另一张照片，请稍候重试')
     const source = database.getArtworkSource(artworkId, versionId)
     if (!source) throw new Error('找不到指定的图片或版本')
-    if (!['image/png', 'image/jpeg', 'image/webp'].includes(source.mime)) throw new Error('人像磨皮支持 PNG、JPEG 和 WebP 照片')
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(source.mime)) throw new Error('人像精修支持 PNG、JPEG 和 WebP 照片')
     working = true
     try {
       const { bytes, faceCount, width, height } = await processPortrait({ bytes: Uint8Array.from(source.bytes), options })

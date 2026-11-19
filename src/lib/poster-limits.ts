@@ -1,0 +1,15 @@
+export const posterBoxLimit = 8192
+export const posterMinSide = 64
+export const posterMaxSide = 4096
+export const posterMaxPixels = 8_400_000
+export const posterCoordinateLimit = 8192
+export const maxPosterImageLayers = 24
+export const maxPosterTextLayers = 12
+export const posterMaskMinRadius = 0.002
+export const posterMaskMaxRadius = 0.25
+export const posterMaskStrokePointLimit = 160
+export const posterMaskStrokeLimit = 96
+export const posterPixelMinRadius = 0.0001
+export const posterPixelMaxRadius = 0.25
+export const posterPixelStrokePointLimit = 256
+export const posterPixelTileSize = 256

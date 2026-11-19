@@ -37,7 +37,7 @@ export function McpDialog({ onClose }: { onClose(): void }) {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 id="mcp-title" className="text-base font-semibold">Agent 接入（MCP）</h2>
-          <p className="mt-1 text-xs leading-5 text-slate-500">允许本机 Agent 管理画布，并使用已配置的文生图模型生成图片。</p>
+          <p className="mt-1 text-xs leading-5 text-slate-500">允许本机 Agent 管理画布、导入本地图片，并使用已配置的模型生成图片。</p>
         </div>
         <Button autoFocus variant="ghost" size="icon" aria-label="关闭 MCP 设置" disabled={busy} onClick={onClose}><X className="h-4 w-4" /></Button>
       </div>

@@ -1,29 +1,69 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
-import { ArrowLeft, Download, Layers3, LoaderCircle, Undo2 } from 'lucide-react'
-import type { Artwork } from '@/types'
-import { posterSizes, type PosterDocument, type PosterImage, type PosterOperation, type PosterOutput, type PosterPoint, type PosterText } from '@/lib/poster'
+import { useContext, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { Download, LoaderCircle } from 'lucide-react'
+import type { Artwork, ModelConfig } from '@/types'
+import type { PhotoMask, PhotoSelectionReference } from '@/lib/photo-edits'
+import type { EditorHistoryEntry } from '@/lib/editor-history'
+import type { PosterDocument, PosterImage, PosterImageLayer, PosterMaskLayerId, PosterOperation, PosterOutput, PosterPoint, PosterText } from '@/lib/poster'
+import { documentSizeLabels, type DocumentSizeMode } from '@/lib/document-size'
+import { posterBoxLimit, posterCoordinateLimit, posterMaxPixels, posterMaxSide, posterMinSide } from '@/lib/poster-limits'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
+import { Slider } from './ui/slider'
 import { Textarea } from './ui/textarea'
+import { EditorInspector, EditorToolSurface } from './EditorToolSurface'
+import { DocumentSizeForm, type SizeSettings } from './DocumentSizeForm'
+import { PosterLayerList } from './PosterLayerList'
+import { PosterMaskEditor, type PosterMaskMode } from './PosterMaskEditor'
+import { PosterPixelEditor } from './PosterPixelEditor'
+import { PosterTransformCanvas } from './PosterTransformCanvas'
 
-type Props = { artwork: Artwork; versionId?: string; onBack(): void }
+type Props = {
+  artwork: Artwork
+  versionId: string
+  versionNumber?: number
+  models: ModelConfig[]
+  photoSelection?: PhotoSelectionReference
+  historyNavigating: boolean
+  historyNavigation?: { revision: number; view: EditorHistoryEntry['view'] }
+  onBusyChange(busy: boolean): void
+  onSourceChange(versionId: string): void
+}
 type Apply = (operation: PosterOperation) => Promise<boolean>
-const tabs = [{ id: 'background', label: '背景' }, { id: 'subject', label: '主体' }, { id: 'shadow', label: '阴影' }, { id: 'text', label: '文字' }] as const
+type MaskSession = { layerId: PosterMaskLayerId; layerName: string; mode: PosterMaskMode; selection?: PhotoMask }
+type PixelSession = { layerId: PosterMaskLayerId; layerName: string; selection?: PhotoMask }
 
 function messageFrom(error: unknown) {
   return error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '') : '操作失败，请重试'
 }
 
-export function PosterEditor({ artwork, versionId, onBack }: Props) {
+function hasLayerMask(poster: PosterDocument, layerId: PosterMaskLayerId) {
+  return Boolean(poster.layerMasks?.[layerId]) || (layerId === 'subject' && poster.mask.type !== 'none')
+}
+
+function hasImageLayer(poster: PosterDocument, layerId: PosterMaskLayerId) {
+  if (layerId === 'subject') return true
+  if (layerId === 'background') return poster.background.type === 'image'
+  return poster.imageLayers.some(layer => `image:${layer.id}` === layerId)
+}
+
+export function ImageLayerEditor({ artwork, versionId, versionNumber, models, photoSelection, historyNavigating, historyNavigation, onBusyChange, onSourceChange }: Props) {
   const [poster, setPoster] = useState<PosterDocument>()
-  const [preview, setPreview] = useState<PosterImage>()
+  const [preview, setPreview] = useState<{ image: PosterImage; size: PosterOutput['size']; generation: number }>()
+  const [previewGeneration, setPreviewGeneration] = useState(0)
   const [source, setSource] = useState<string>()
   const [sourceRatio, setSourceRatio] = useState(1)
   const [points, setPoints] = useState<PosterPoint[]>()
-  const [tab, setTab] = useState<(typeof tabs)[number]['id']>('subject')
+  const [layerId, setLayerId] = useState('subject')
+  const [maskSession, setMaskSession] = useState<MaskSession>()
+  const [pixelSession, setPixelSession] = useState<PixelSession>()
+  const editingLayerSource = Boolean(maskSession || pixelSession)
   const [busy, setBusy] = useState(false)
+  const editing = useRef(false)
+  const handledNavigation = useRef<number>()
   const [refreshing, setRefreshing] = useState(false)
   const [size, setSize] = useState<PosterOutput['size']>('current')
+  const [sizeMode, setSizeMode] = useState<DocumentSizeMode>()
+  const { panel, openPanel } = useContext(EditorInspector)
   const [format, setFormat] = useState<PosterOutput['format']>('png')
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
@@ -33,6 +73,7 @@ export function PosterEditor({ artwork, versionId, onBack }: Props) {
     let closed = false
     const unsubscribe = window.studio.onMcpWorkspaceChanged(change => {
       if (change.type === 'poster_updated' && change.poster.artworkId === artwork.id) accept(change.poster)
+      if (change.type === 'artwork_deleted' || change.type === 'canvas_deleted') setPreviewGeneration(value => value + 1)
     })
     window.studio.openPoster(artwork.id, versionId).then(updated => {
       if (!closed) accept(updated)
@@ -40,34 +81,59 @@ export function PosterEditor({ artwork, versionId, onBack }: Props) {
     return () => { closed = true; unsubscribe() }
   }, [artwork.id, versionId])
 
+  const sourceVersionId = poster?.sourceVersionId
   useEffect(() => {
-    if (!poster) return
+    if (sourceVersionId) onSourceChange(sourceVersionId)
+  }, [sourceVersionId, onSourceChange])
+
+  useEffect(() => {
+    if (panel === 'layers') setSizeMode(undefined)
+  }, [panel])
+
+  useEffect(() => {
+    if (!historyNavigation || handledNavigation.current === historyNavigation.revision) return
+    handledNavigation.current = historyNavigation.revision
+    setPoints(undefined)
+    setSizeMode(undefined)
+    setError('')
+    setMessage('')
+    setMaskSession(current => poster && historyNavigation.view === 'poster' && current?.mode === 'brush' && hasLayerMask(poster, current.layerId)
+      ? current : undefined)
+    setPixelSession(current => poster && historyNavigation.view === 'poster' && current && hasImageLayer(poster, current.layerId)
+      ? current : undefined)
+  }, [historyNavigation, poster])
+
+  useEffect(() => {
+    if (!poster || editingLayerSource) return
     let closed = false
     setRefreshing(true)
     window.studio.previewPoster(artwork.id, size).then(result => {
-      if (!closed) setPreview(result)
+      if (!closed) setPreview({ image: result, size, generation: previewGeneration })
     }).catch(cause => {
       if (!closed) { setPreview(undefined); setError(messageFrom(cause)) }
     }).finally(() => { if (!closed) setRefreshing(false) })
     return () => { closed = true }
-  }, [artwork.id, poster, size])
+  }, [artwork.id, editingLayerSource, poster, previewGeneration, size])
 
   const run = async (action: () => Promise<void>) => {
-    if (busy) return false
+    if (editing.current || historyNavigating) return false
+    editing.current = true
+    onBusyChange(true)
     setBusy(true); setError(''); setMessage('')
     try { await action(); return true }
     catch (cause) { setError(messageFrom(cause)); return false }
-    finally { setBusy(false) }
+    finally { editing.current = false; setBusy(false); onBusyChange(false) }
   }
 
-  const apply: Apply = operation => run(async () => {
-    if (!poster) return
-    accept(await window.studio.editPoster({ artworkId: artwork.id, revision: poster.revision, operations: [operation] }))
-  })
+  const applyOperations = (operations: PosterOperation[]) => poster
+    ? run(async () => accept(await window.studio.editPoster({ artworkId: artwork.id, revision: poster.revision, operations })))
+    : Promise.resolve(false)
+  const apply: Apply = operation => applyOperations([operation])
 
   const beginSelection = () => run(async () => {
-    if (!source) setSource(await window.studio.getPosterSource(artwork.id))
-    setPoints(poster?.mask.type === 'polygon' ? poster.mask.points : [])
+    if (!poster) return
+    setSource(await window.studio.getPosterSource(artwork.id))
+    setPoints(poster.mask.type === 'polygon' ? poster.mask.points : [])
   })
 
   const finishSelection = async () => {
@@ -79,29 +145,107 @@ export function PosterEditor({ artwork, versionId, onBack }: Props) {
     setMessage(`已导出 ${result.width} × ${result.height}：${result.path}`)
   })
 
-  return <div className="fixed inset-0 z-[60] flex flex-col bg-white">
-    <header className="drag-region flex shrink-0 flex-wrap items-center justify-between gap-2 border-b px-3 pb-2 pt-1 md:px-5 md:py-3">
-      <div className="no-drag flex min-w-0 items-center gap-2 max-sm:pl-16 md:gap-3">
-        <Button variant="ghost" size="icon" aria-label="返回图片编辑器" onClick={onBack}><ArrowLeft className="h-4 w-4" /></Button>
-        <Layers3 className="h-4 w-4 shrink-0 text-violet-600" />
-        <div className="min-w-0"><h2 className="text-sm font-semibold">分层海报</h2><p className="max-w-72 truncate text-xs text-slate-500">{artwork.prompt || '未命名图片'}</p></div>
-      </div>
-      <div className="no-drag flex w-full min-w-0 flex-wrap items-center gap-1.5 sm:w-auto sm:gap-2">
-        <Button variant="outline" size="sm" aria-label="撤销" title="撤销" className="max-[420px]:w-8 max-[420px]:px-0" disabled={busy || !poster?.canUndo || Boolean(points)} onClick={() => run(async () => { if (poster) accept(await window.studio.undoPoster(artwork.id, poster.revision)) })}>
-          <Undo2 className="h-4 w-4" /><span className="hidden min-[420px]:inline">撤销</span>
-        </Button>
-        <select aria-label="导出比例" className="h-8 rounded-md border bg-white px-2 text-xs" value={size} disabled={Boolean(points)} onChange={event => setSize(event.target.value as PosterOutput['size'])}>
+  const addText = async (price: boolean) => {
+    if (!poster) return
+    const scale = poster.width / 1080
+    const layer: PosterText = {
+      id: crypto.randomUUID(), text: price ? '¥ 99' : '商品标题', x: Math.round(poster.width * .08),
+      y: Math.round(poster.height * (price ? .16 : .06)), width: Math.round(poster.width * .84),
+      fontSize: Math.max(8, Math.round((price ? 42 : 70) * scale)), color: '#272033', align: 'left', weight: 'bold', visible: true
+    }
+    if (await apply({ op: 'upsert_text', layer })) setLayerId(`text:${layer.id}`)
+  }
+
+  const text = layerId.startsWith('text:') ? poster?.textLayers.find(layer => layer.id === layerId.slice(5)) : undefined
+  const image = layerId.startsWith('image:') ? poster?.imageLayers.find(layer => layer.id === layerId.slice(6)) : undefined
+  const activeLayer = text || image || layerId === 'background' || layerId === 'shadow' ? layerId : 'subject'
+  const layerName = image?.name ?? (text ? '文字' : activeLayer === 'background' ? '背景' : activeLayer === 'shadow' ? '阴影' : '主体')
+  const background = activeLayer === 'background' && poster?.background.type === 'image' ? poster.background : undefined
+  const maskLayerId: PosterMaskLayerId | undefined = image ? `image:${image.id}` : background ? 'background' : activeLayer === 'subject' ? 'subject' : undefined
+  const layerSource = image ?? background ?? { artworkId: artwork.id, versionId: sourceVersionId }
+  const matchingSelection = photoSelection && photoSelection.artworkId === layerSource.artworkId && photoSelection.versionId === layerSource.versionId
+    ? photoSelection.selection : undefined
+  const maskBase = maskLayerId && poster?.layerMasks?.[maskLayerId]?.base
+  const controlsDisabled = busy || historyNavigating || Boolean(points)
+  const matchingPreview = Boolean(preview && preview.image.revision === poster?.revision && preview.size === size && preview.generation === previewGeneration)
+
+  function openSize(mode: DocumentSizeMode) {
+    setSizeMode(mode)
+    setSize('current')
+    setError('')
+    setMessage('')
+    openPanel('properties')
+  }
+
+  async function applySize(mode: DocumentSizeMode, { width, height, anchor }: SizeSettings) {
+    const operation = mode === 'image' ? { op: 'set_size' as const, width, height }
+      : { op: 'set_canvas_size' as const, width, height, anchor }
+    if (await apply(operation)) setMessage(`已调整为 ${width} × ${height} px`)
+  }
+
+  if (poster && maskSession) return <PosterMaskEditor poster={poster} layerId={maskSession.layerId} layerName={maskSession.layerName}
+    initialMode={maskSession.mode} initialSelection={maskSession.selection} sourceGeneration={previewGeneration} hasMask={hasLayerMask(poster, maskSession.layerId)}
+    busy={busy || historyNavigating} error={error} onEdit={apply} onClose={() => { setMaskSession(undefined); setError('') }} />
+
+  if (poster && pixelSession) return <PosterPixelEditor key={pixelSession.layerId} poster={poster} layerId={pixelSession.layerId}
+    layerName={pixelSession.layerName} initialSelection={pixelSession.selection} models={models} disabled={busy || historyNavigating}
+    sourceGeneration={previewGeneration} error={error}
+    onPaint={stroke => run(async () => accept(await window.studio.paintPosterLayerPixels({
+      artworkId: artwork.id, layerId: pixelSession.layerId, revision: poster.revision, stroke
+    })))}
+    onApplyRegion={draftId => run(async () => accept(await window.studio.savePosterLayerRegion(draftId)))}
+    onClose={() => {
+      setPixelSession(undefined)
+      setError('')
+      if (panel !== 'history') openPanel('layers')
+    }} />
+
+  return <EditorToolSurface name={sizeMode ? documentSizeLabels[sizeMode] : '图层合成'} expandedCanvas={Boolean(points)}
+    options={<>
+        {poster && maskLayerId && !sizeMode && <Button size="sm" variant="outline" disabled={controlsDisabled} onClick={() => {
+          setMessage('')
+          setError('')
+          setPixelSession({ layerId: maskLayerId, layerName, selection: matchingSelection })
+          openPanel('properties')
+        }}>像素编辑</Button>}
+        {sizeMode && <Button size="sm" variant="ghost" disabled={controlsDisabled} onClick={() => { setSizeMode(undefined); openPanel('layers') }}>返回合成</Button>}
+        {(['image', 'canvas'] as const).filter(mode => mode !== sizeMode).map(mode => <Button key={mode} size="sm" variant="outline"
+          disabled={!poster || controlsDisabled} onClick={() => openSize(mode)}>{documentSizeLabels[mode]}</Button>)}
+        {!sizeMode && <>
+        <select aria-label="导出比例" className="h-8 rounded-md border bg-white px-2 text-xs" value={size} disabled={controlsDisabled} onChange={event => setSize(event.target.value as PosterOutput['size'])}>
           <option value="current">当前尺寸</option><option value="square">方图 1:1</option><option value="portrait">竖图 2:3</option>
         </select>
         <select aria-label="导出格式" className="h-8 rounded-md border bg-white px-2 text-xs" value={format} onChange={event => setFormat(event.target.value as PosterOutput['format'])}>
           <option value="png">PNG</option><option value="jpeg">JPEG</option>
         </select>
-        <Button size="sm" aria-label="导出海报" disabled={busy || !preview || Boolean(points)} onClick={exportImage}><Download className="h-4 w-4" /><span className="sm:hidden">导出</span><span className="hidden sm:inline">导出海报</span></Button>
-      </div>
-    </header>
-
-    <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-      <main className={`checkerboard flex min-h-0 min-w-0 flex-col items-center justify-center gap-2 overflow-hidden p-3 md:gap-3 md:p-5 ${points ? 'flex-1' : 'h-[43%] shrink-0 md:h-auto md:flex-1'}`}>
+        <Button size="sm" aria-label="导出合成图" disabled={controlsDisabled || !preview || !matchingPreview} onClick={exportImage}><Download className="h-4 w-4" /><span className="sm:hidden">导出</span><span className="hidden sm:inline">导出合成图</span></Button>
+        </>}
+    </>}
+    layers={poster && !sizeMode && <PosterLayerList poster={poster} canvasId={artwork.canvasId} selectedLayerId={activeLayer} disabled={controlsDisabled}
+      onSelect={setLayerId} onAddText={addText} onEdit={applyOperations} />}
+    properties={<>
+      {poster && sizeMode && <DocumentSizeForm key={`${sizeMode}:${poster.revision}`} mode={sizeMode} current={poster}
+        min={posterMinSide} max={posterMaxSide} maxPixels={posterMaxPixels} disabled={controlsDisabled} onApply={value => void applySize(sizeMode, value)} />}
+      {poster && !sizeMode && <fieldset disabled={controlsDisabled} className="min-w-0 disabled:opacity-60" key={`${activeLayer}-${poster.revision}`}>
+        <legend className="mb-3 max-w-full truncate text-xs font-semibold text-slate-800" title={layerName}>{layerName}属性</legend>
+        {image?.visible && matchingPreview && !preview?.image.imageBounds[`image:${image.id}`] &&
+          <p className="mb-3 text-xs text-amber-700" role="status">源图片已不可用</p>}
+        {maskLayerId && <MaskControls layerId={maskLayerId} hasMask={hasLayerMask(poster, maskLayerId)} selection={matchingSelection} apply={apply}
+          onOpen={mode => {
+            setError('')
+            setMessage('')
+            const selection = matchingSelection ?? (maskBase && maskBase.type === 'selection' ? maskBase.selection : undefined)
+            setMaskSession({ layerId: maskLayerId, layerName, mode, selection })
+          }} />}
+        {image && <ImageControls layer={image} apply={apply} disabled={controlsDisabled} />}
+        {activeLayer === 'background' && <BackgroundControls poster={poster} artwork={artwork} apply={apply} />}
+        {activeLayer === 'subject' && <SubjectControls poster={poster} apply={apply} disabled={controlsDisabled} beginSelection={beginSelection} />}
+        {activeLayer === 'shadow' && <ShadowControls poster={poster} apply={apply} />}
+        {text && <TextControls layer={text} apply={apply} />}
+      </fieldset>}
+      {(error || message) && <p role={error ? 'alert' : 'status'} className={`mt-3 break-words text-xs leading-5 ${error ? 'text-red-600' : 'text-slate-600'}`}>{error || message}</p>}
+    </>}
+    status={preview && <>{versionNumber && <span>图片源 V{versionNumber}</span>}<span>{preview.image.width} × {preview.image.height} px</span>{refreshing && <span>正在更新</span>}</>}>
         {points && source ? <>
           <div className="flex min-h-0 w-full flex-1 items-center justify-center [container-type:size]">
             <div className="relative cursor-crosshair" style={{ width: `min(100cqw, ${sourceRatio * 100}cqh)`, aspectRatio: sourceRatio }} onClick={event => {
@@ -121,35 +265,40 @@ export function PosterEditor({ artwork, versionId, onBack }: Props) {
             <Button size="sm" variant="outline" onClick={() => setPoints(undefined)} disabled={busy}>取消</Button>
             <Button size="sm" onClick={finishSelection} disabled={busy || points.length < 3}>应用选区</Button>
           </div>
-        </> : preview ? <>
-          <img alt="海报预览" src={preview.src} className="block min-h-0 max-h-full max-w-full rounded-sm object-contain shadow-lg" />
-          <span className="shrink-0 rounded-md border bg-white px-2 py-1 text-xs tabular-nums text-slate-600">{preview.width} × {preview.height}{refreshing ? ' · 更新预览中' : ''}</span>
-        </> : refreshing || !error ? <LoaderCircle className="h-6 w-6 animate-spin text-violet-600" /> : <span className="rounded-md border bg-white p-3 text-xs text-slate-600">预览暂不可用，可调整图层后重试。</span>}
-      </main>
-
-      <aside className={`min-h-0 min-w-0 flex-1 flex-col border-t bg-white md:flex md:w-[344px] md:flex-none md:border-l md:border-t-0 ${points ? 'hidden' : 'flex'}`}>
-        <div className="shrink-0 border-b p-2 md:p-4">
-          <h3 className="hidden text-sm font-semibold md:block">图层</h3>
-          <div className="grid grid-cols-4 gap-1 md:mt-3">
-            {tabs.map(item => <Button key={item.id} size="sm" variant={tab === item.id ? 'secondary' : 'ghost'} aria-pressed={tab === item.id} onClick={() => setTab(item.id)}>{item.label}</Button>)}
-          </div>
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4">
-          {poster && <fieldset disabled={busy || Boolean(points)} className="min-w-0 disabled:opacity-60" key={`${tab}-${poster.revision}`}>
-            {tab === 'background' && <BackgroundControls poster={poster} artwork={artwork} apply={apply} />}
-            {tab === 'subject' && <SubjectControls poster={poster} apply={apply} beginSelection={beginSelection} />}
-            {tab === 'shadow' && <ShadowControls poster={poster} apply={apply} />}
-            {tab === 'text' && <TextControls poster={poster} apply={apply} />}
-          </fieldset>}
-        </div>
-        {(error || message) && <p role={error ? 'alert' : 'status'} className={`max-h-24 shrink-0 overflow-y-auto break-all border-t p-3 text-xs leading-5 md:p-4 ${error ? 'text-red-600' : 'text-slate-600'}`}>{error || message}</p>}
-      </aside>
-    </div>
-  </div>
+        </> : preview && poster ? <PosterTransformCanvas poster={poster} preview={preview.image} size={preview.size} selectedLayerId={activeLayer}
+          disabled={controlsDisabled || Boolean(sizeMode) || refreshing || !matchingPreview} onSelect={setLayerId}
+          onTransform={(id, transform) => id === 'subject'
+            ? apply({ op: 'set_subject', subject: transform })
+            : apply({ op: 'set_image', layerId: id.slice(6), layer: transform })} />
+        : refreshing || !error ? <LoaderCircle className="h-6 w-6 animate-spin text-violet-600" /> : <span className="rounded-md border bg-white p-3 text-xs text-slate-600">预览暂不可用，可调整图层后重试。</span>}
+  </EditorToolSurface>
 }
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return <label className="block space-y-1.5 text-xs font-medium text-slate-700"><span>{label}</span>{children}</label>
+}
+
+function MaskControls({ layerId, hasMask, selection, apply, onOpen }: {
+  layerId: PosterMaskLayerId
+  hasMask: boolean
+  selection?: PhotoMask
+  apply: Apply
+  onOpen(mode: PosterMaskMode): void
+}) {
+  const create = async (base: { type: 'reveal' } | { type: 'selection'; selection: PhotoMask }) => {
+    if (await apply({ op: 'set_layer_mask', layerId, base })) onOpen('brush')
+  }
+  return <section aria-label="图层蒙版" className="mb-4 space-y-2 border-b pb-3">
+    <h3 className="text-xs font-medium text-slate-700">蒙版</h3>
+    <div className="flex flex-wrap gap-1.5">
+      {hasMask
+        ? <Button size="sm" variant="outline" onClick={() => onOpen('brush')}>编辑蒙版</Button>
+        : <Button size="sm" variant="outline" onClick={() => void create({ type: 'reveal' })}>添加蒙版</Button>}
+      <Button size="sm" variant="ghost" onClick={() => onOpen('selection')}>绘制选区</Button>
+      {selection && <Button size="sm" variant="outline" onClick={() => void create({ type: 'selection', selection })}>选区转蒙版</Button>}
+      {hasMask && <Button size="sm" variant="ghost" onClick={() => void apply({ op: 'set_layer_mask', layerId, base: null })}>移除蒙版</Button>}
+    </div>
+  </section>
 }
 
 function NumberField({ label, name, value, min, max, step }: { label: string; name: string; value: number; min: number; max: number; step?: 'any' }) {
@@ -208,19 +357,60 @@ function BackgroundControls({ poster, artwork, apply }: { poster: PosterDocument
   </form>
 }
 
-function SubjectControls({ poster, apply, beginSelection }: { poster: PosterDocument; apply: Apply; beginSelection(): void }) {
+function LayerOpacity({ opacity, disabled, onChange }: {
+  opacity: number; disabled: boolean; onChange(opacity: number): Promise<boolean>
+}) {
+  const percent = Math.round(opacity * 100)
+  const [value, setValue] = useState(percent)
+  return <div className="space-y-2">
+    <div className="flex items-center justify-between text-xs font-medium text-slate-700">
+      <span>不透明度</span><span className="tabular-nums">{value}%</span>
+    </div>
+    <Slider aria-label="不透明度" min={0} max={100} step={1} value={[value]} disabled={disabled}
+      onValueChange={([next]) => setValue(next)}
+      onValueCommit={async ([next]) => {
+        if (next !== percent && !await onChange(next / 100)) setValue(percent)
+      }} />
+  </div>
+}
+
+function ImageControls({ layer, apply, disabled }: { layer: PosterImageLayer; apply: Apply; disabled: boolean }) {
+  const edit = (properties: Partial<Pick<PosterImageLayer, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity'>>) =>
+    apply({ op: 'set_image', layerId: layer.id, layer: properties })
+  return <div className="space-y-4">
+    <LayerOpacity opacity={layer.opacity} disabled={disabled} onChange={opacity => edit({ opacity })} />
+    <form className="space-y-3 border-t pt-3" onSubmit={event => {
+      const form = formValues(event)
+      void edit({ x: Number(form.get('x')), y: Number(form.get('y')), width: Number(form.get('width')),
+        height: Number(form.get('height')), rotation: Number(form.get('rotation')) })
+    }}>
+      <div className="grid grid-cols-2 gap-3">
+        <NumberField label="横坐标" name="x" value={layer.x} min={-posterCoordinateLimit} max={posterCoordinateLimit} />
+        <NumberField label="纵坐标" name="y" value={layer.y} min={-posterCoordinateLimit} max={posterCoordinateLimit} />
+        <NumberField label="宽度" name="width" value={layer.width} min={1} max={posterBoxLimit} />
+        <NumberField label="高度" name="height" value={layer.height} min={1} max={posterBoxLimit} />
+        <NumberField label="旋转角度" name="rotation" value={layer.rotation ?? 0} min={-180} max={180} step="any" />
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <Button type="submit" size="sm" variant="outline">应用变换</Button>
+        <Button type="button" size="sm" variant="ghost" onClick={() => void apply({ op: 'remove_image', layerId: layer.id })}>移除图层</Button>
+      </div>
+    </form>
+  </div>
+}
+
+function SubjectControls({ poster, apply, disabled, beginSelection }: { poster: PosterDocument; apply: Apply; disabled: boolean; beginSelection(): void }) {
   const { subject, mask } = poster
   return <div className="space-y-5">
+    <LayerOpacity opacity={subject.opacity} disabled={disabled} onChange={opacity => apply({ op: 'set_subject', subject: { opacity } })} />
     <form className="space-y-3" onSubmit={event => {
       const form = formValues(event)
       void apply({ op: 'set_mask', mask: { type: 'edge_color', tolerance: Number(form.get('tolerance')) } })
     }}>
-      <p className="text-xs leading-5 text-slate-500">{mask.type === 'none' ? '当前使用原图' : mask.type === 'edge_color' ? '当前使用纯色抠图蒙版' : '当前使用手动选区蒙版'}</p>
       <NumberField label="去纯色背景的容差" name="tolerance" value={mask.type === 'edge_color' ? mask.tolerance : 32} min={1} max={150} />
       <div className="flex flex-wrap gap-2">
         <Button size="sm" type="submit">去纯色背景</Button>
         <Button size="sm" type="button" variant="outline" onClick={beginSelection}>手动描边</Button>
-        {mask.type !== 'none' && <Button size="sm" type="button" variant="ghost" onClick={() => apply({ op: 'set_mask', mask: { type: 'none' } })}>移除蒙版</Button>}
       </div>
     </form>
     <form className="space-y-3 border-t pt-4" onSubmit={event => {
@@ -228,7 +418,7 @@ function SubjectControls({ poster, apply, beginSelection }: { poster: PosterDocu
       const n = (name: string) => Number(form.get(name))
       void apply({ op: 'set_subject', subject: {
         x: n('x'), y: n('y'), width: n('width'), height: n('height'), rotation: n('rotation'),
-        brightness: n('brightness'), saturation: n('saturation'), opacity: n('opacity') / 100, visible: form.has('visible')
+        brightness: n('brightness'), saturation: n('saturation'), visible: form.has('visible')
       } })
     }}>
       <div className="grid grid-cols-2 gap-3">
@@ -237,7 +427,6 @@ function SubjectControls({ poster, apply, beginSelection }: { poster: PosterDocu
         <NumberField label="宽度" name="width" value={subject.width} min={1} max={8192} />
         <NumberField label="高度" name="height" value={subject.height} min={1} max={8192} />
         <NumberField label="旋转角度" name="rotation" value={subject.rotation} min={-180} max={180} step="any" />
-        <NumberField label="不透明度 %" name="opacity" value={Math.round(subject.opacity * 100)} min={0} max={100} />
         <NumberField label="亮度 %" name="brightness" value={subject.brightness} min={0} max={200} />
         <NumberField label="饱和度 %" name="saturation" value={subject.saturation} min={0} max={200} />
       </div>
@@ -259,53 +448,31 @@ function ShadowControls({ poster, apply }: { poster: PosterDocument; apply: Appl
   </form>
 }
 
-function TextControls({ poster, apply }: { poster: PosterDocument; apply: Apply }) {
-  const [selected, setSelected] = useState(poster.textLayers.at(-1)?.id || '')
-  const layer = poster.textLayers.find(item => item.id === selected)
-  const add = (price: boolean) => {
-    const scale = poster.width / 1080
-    const layer: PosterText = {
-      id: crypto.randomUUID(), text: price ? '¥ 99' : '商品标题', x: Math.round(poster.width * .08),
-      y: Math.round(poster.height * (price ? .16 : .06)), width: Math.round(poster.width * .84),
-      fontSize: Math.max(8, Math.round((price ? 42 : 70) * scale)), color: '#272033', align: 'left', weight: 'bold', visible: true
-    }
-    void apply({ op: 'upsert_text', layer })
-  }
-  return <div className="space-y-3">
-    <div className="flex gap-2">
-      <Button size="sm" variant="outline" disabled={poster.textLayers.length >= 12} onClick={() => add(false)}>添加标题</Button>
-      <Button size="sm" variant="outline" disabled={poster.textLayers.length >= 12} onClick={() => add(true)}>添加价格</Button>
-    </div>
-    {layer && <>
-      <Field label="文字图层"><select className="setting-select" value={selected} onChange={event => setSelected(event.target.value)}>
-        {poster.textLayers.map(item => <option value={item.id} key={item.id}>{item.text.slice(0, 36)}</option>)}
+function TextControls({ layer, apply }: { layer: PosterText; apply: Apply }) {
+  return <form key={layer.id} className="space-y-3" onSubmit={event => {
+    const form = formValues(event)
+    void apply({ op: 'upsert_text', layer: { ...layer, text: String(form.get('text')), color: String(form.get('color')),
+      x: Number(form.get('x')), y: Number(form.get('y')), width: Number(form.get('width')), fontSize: Number(form.get('fontSize')),
+      align: String(form.get('align')) as PosterText['align'], weight: form.has('bold') ? 'bold' : 'regular', visible: form.has('visible') } })
+  }}>
+    <Field label="内容"><Textarea name="text" defaultValue={layer.text} maxLength={300} required className="min-h-16 resize-y" /></Field>
+    <div className="grid grid-cols-2 gap-3">
+      <NumberField label="横坐标" name="x" value={layer.x} min={-8192} max={8192} />
+      <NumberField label="纵坐标" name="y" value={layer.y} min={-8192} max={8192} />
+      <NumberField label="文字框宽度" name="width" value={layer.width} min={1} max={8192} />
+      <NumberField label="字号" name="fontSize" value={layer.fontSize} min={1} max={1000} />
+      <ColorField label="文字颜色" name="color" value={layer.color} />
+      <Field label="对齐"><select className="setting-select" name="align" defaultValue={layer.align}>
+        <option value="left">左对齐</option><option value="center">居中</option><option value="right">右对齐</option>
       </select></Field>
-      <form key={layer.id} className="space-y-3" onSubmit={event => {
-        const form = formValues(event)
-        void apply({ op: 'upsert_text', layer: { ...layer, text: String(form.get('text')), color: String(form.get('color')),
-          x: Number(form.get('x')), y: Number(form.get('y')), width: Number(form.get('width')), fontSize: Number(form.get('fontSize')),
-          align: String(form.get('align')) as PosterText['align'], weight: form.has('bold') ? 'bold' : 'regular', visible: form.has('visible') } })
-      }}>
-        <Field label="内容"><Textarea name="text" defaultValue={layer.text} maxLength={300} required className="min-h-16 resize-y" /></Field>
-        <div className="grid grid-cols-2 gap-3">
-          <NumberField label="横坐标" name="x" value={layer.x} min={-8192} max={8192} />
-          <NumberField label="纵坐标" name="y" value={layer.y} min={-8192} max={8192} />
-          <NumberField label="文字框宽度" name="width" value={layer.width} min={1} max={8192} />
-          <NumberField label="字号" name="fontSize" value={layer.fontSize} min={1} max={1000} />
-          <ColorField label="文字颜色" name="color" value={layer.color} />
-          <Field label="对齐"><select className="setting-select" name="align" defaultValue={layer.align}>
-            <option value="left">左对齐</option><option value="center">居中</option><option value="right">右对齐</option>
-          </select></Field>
-        </div>
-        <div className="flex gap-4">
-          <label className="flex items-center gap-2 text-xs"><input type="checkbox" name="bold" defaultChecked={layer.weight === 'bold'} />加粗</label>
-          <label className="flex items-center gap-2 text-xs"><input type="checkbox" name="visible" defaultChecked={layer.visible} />显示文字</label>
-        </div>
-        <div className="flex gap-2">
-          <Button type="submit" size="sm">应用文字</Button>
-          <Button type="button" variant="ghost" size="sm" onClick={() => apply({ op: 'remove_text', layerId: layer.id })}>移除文字层</Button>
-        </div>
-      </form>
-    </>}
-  </div>
+    </div>
+    <div className="flex gap-4">
+      <label className="flex items-center gap-2 text-xs"><input type="checkbox" name="bold" defaultChecked={layer.weight === 'bold'} />加粗</label>
+      <label className="flex items-center gap-2 text-xs"><input type="checkbox" name="visible" defaultChecked={layer.visible} />显示文字</label>
+    </div>
+    <div className="flex gap-2">
+      <Button type="submit" size="sm">应用文字</Button>
+      <Button type="button" variant="ghost" size="sm" onClick={() => apply({ op: 'remove_text', layerId: layer.id })}>移除文字层</Button>
+    </div>
+  </form>
 }

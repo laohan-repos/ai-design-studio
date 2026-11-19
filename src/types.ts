@@ -1,4 +1,6 @@
 import type { PosterDocument } from './lib/poster'
+import type { CanvasGroupingChange } from './lib/canvas-groups'
+import type { EditorHistory } from './lib/editor-history'
 
 export type ModelConfig = {
   id: string
@@ -26,6 +28,7 @@ export type Adjustments = { brightness: number; contrast: number; saturation: nu
 export type Artwork = {
   id: string
   canvasId: string
+  groupId?: string | null
   src: string
   prompt: string
   createdAt: number
@@ -70,12 +73,14 @@ export type McpWorkspaceChange =
   | { type: 'canvas_created'; canvas: InfiniteCanvasRecord }
   | { type: 'canvas_renamed'; canvasId: string; name: string; updatedAt: number }
   | { type: 'canvas_deleted'; canvasId: string; nextCanvasId?: string }
+  | { type: 'canvas_groups_changed'; result: CanvasGroupingChange }
   | { type: 'artwork_created'; result: GeneratedArtwork }
   | { type: 'artwork_moved'; artworkId: string; canvasId: string; x: number; y: number; updatedAt: number }
   | { type: 'artwork_deleted'; artworkId: string; canvasId: string; artworkCount: number; updatedAt: number; coverSrc?: string }
   | { type: 'artwork_versions_changed'; artworkId: string }
-  | { type: 'artwork_version_applied'; result: { version: ArtworkVersion; canvasId: string; isCover: boolean; updatedAt: number } }
+  | { type: 'artwork_version_applied'; viaHistory?: boolean; result: { version: ArtworkVersion; canvasId: string; isCover: boolean; updatedAt: number } }
   | { type: 'poster_updated'; poster: PosterDocument }
+  | { type: 'editor_history_changed'; history: EditorHistory; reason: 'edit' | 'navigate' }
 
 export type McpStatus = { running: boolean; url: string; error?: string }
 

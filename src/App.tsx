@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertTriangle, Brush, ChevronDown, ChevronUp, Download, Ellipsis, ImagePlus, LayoutDashboard, LoaderCircle, Menu, Pencil, Plug, Plus, Settings2, Sparkles, Trash2, Upload, X } from 'lucide-react'
+import { AlertTriangle, Brush, ChevronDown, ChevronUp, Download, Ellipsis, FolderInput, FolderPlus, ImagePlus, LayoutDashboard, LoaderCircle, Menu, Pencil, Plug, Plus, Settings2, Sparkles, Trash2, Upload, X } from 'lucide-react'
 import logo from '@/assets/chutu-logo.png'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -8,7 +8,10 @@ import { ModelDialog } from '@/components/ModelDialog'
 import { McpDialog } from '@/components/McpDialog'
 import { ImageEditor } from '@/components/ImageEditor'
 import { InfiniteCanvas, type CanvasImage } from '@/components/InfiniteCanvas'
+import { CanvasArtworkGroups } from '@/components/CanvasArtworkGroups'
+import { ArtworkGroupDialog, type GroupDialog } from '@/components/ArtworkGroupDialog'
 import type { GeneratedArtwork, InfiniteCanvasRecord, ModelConfig } from '@/types'
+import type { ArtworkGroup, ArtworkGroupChangeInput } from '@/lib/canvas-groups'
 
 function mergeArtworks(loaded: CanvasImage[], additions: CanvasImage[]) {
   const loadedIds = new Set(loaded.map(item => item.id))
@@ -28,6 +31,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [mcpOpen, setMcpOpen] = useState(false)
   const [editing, setEditing] = useState<CanvasImage>()
+  const [viewedVersion, setViewedVersion] = useState<{ artworkId: string; versionId: string }>()
   const [loadingCanvas, setLoadingCanvas] = useState(true)
   const [creating, setCreating] = useState(false)
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
@@ -46,12 +50,19 @@ export default function App() {
   const [deleting, setDeleting] = useState(false)
   const [expandedCanvasIds, setExpandedCanvasIds] = useState<string[]>([])
   const [canvasItems, setCanvasItems] = useState<Record<string, CanvasImage[]>>({})
-  const [focusArtwork, setFocusArtwork] = useState<{ id: string; sequence: number }>()
+  const [canvasGroups, setCanvasGroups] = useState<Record<string, ArtworkGroup[]>>({})
+  const [groupDialog, setGroupDialog] = useState<GroupDialog>()
+  const [focusArtworks, setFocusArtworks] = useState<{ ids: string[]; fit?: boolean }>()
   const [toast, setToast] = useState<string>()
   const fileInput = useRef<HTMLInputElement>(null)
   const activeCanvas = canvases.find(canvas => canvas.id === activeCanvasId)
   const selected = selectedIds.length === 1 ? gallery.find(item => item.id === selectedIds[0]) : undefined
   const textModels = models.filter(model => model.taskType === 'text-to-image')
+
+  useEffect(() => {
+    window.studio.updateEditorContext({ canvasId: editing?.canvasId || activeCanvasId || undefined, selectedArtworkIds: selectedIds.slice(0, 512),
+      editingArtworkId: editing?.id, viewedVersionId: editing && viewedVersion?.artworkId === editing.id ? viewedVersion.versionId : undefined })
+  }, [activeCanvasId, editing, selectedIds, viewedVersion])
 
   const readWorkspace = useCallback(async function readLatest<T>(read: () => Promise<T>): Promise<T> {
     const revision = workspaceRevision.current
@@ -66,14 +77,15 @@ export default function App() {
     setActiveCanvasId(id)
     setSelectedIds([])
     setGallery([])
-    setFocusArtwork(undefined)
+    setFocusArtworks(undefined)
     if (!id) { setLoadingCanvas(false); return }
     setLoadingCanvas(true)
     try {
-      const artworks = await readWorkspace(() => window.studio.listArtworks(id))
+      const [artworks, grouping] = await readWorkspace(() => Promise.all([window.studio.listArtworks(id), window.studio.listArtworkGroups(id)]))
       if (request !== canvasRequest.current) return
       setGallery(items => mergeArtworks(artworks, items))
       setCanvasItems(items => ({ ...items, [id]: mergeArtworks(artworks, items[id] || []) }))
+      setCanvasGroups(groups => ({ ...groups, [id]: grouping.groups }))
     } catch (error) {
       if (request === canvasRequest.current) setToast(error instanceof Error ? error.message : '画布加载失败')
     } finally {
@@ -94,7 +106,7 @@ export default function App() {
   useEffect(() => {
     let closed = false
     const unsubscribe = window.studio.onMcpWorkspaceChanged(change => {
-      if (change.type === 'poster_updated' || change.type === 'artwork_versions_changed') return
+      if (change.type === 'poster_updated' || change.type === 'artwork_versions_changed' || change.type === 'editor_history_changed') return
       workspaceRevision.current++
       if (change.type === 'canvas_created') {
         setCanvases(items => items.some(canvas => canvas.id === change.canvas.id) ? items : [change.canvas, ...items])
@@ -107,12 +119,23 @@ export default function App() {
         setCanvases(items => items.filter(canvas => canvas.id !== canvasId))
         setExpandedCanvasIds(items => items.filter(id => id !== canvasId))
         setCanvasItems(items => Object.fromEntries(Object.entries(items).filter(([id]) => id !== canvasId)))
+        setCanvasGroups(groups => Object.fromEntries(Object.entries(groups).filter(([id]) => id !== canvasId)))
+        setGroupDialog(dialog => dialog?.canvasId === canvasId ? undefined : dialog)
         setContextMenu(menu => menu?.canvasId === canvasId ? undefined : menu)
         setRenamingCanvasId(id => id === canvasId ? undefined : id)
         setImageCanvasId(id => id === canvasId ? undefined : id)
         setEditing(item => item?.canvasId === canvasId ? undefined : item)
         setDeletingArtwork(item => item?.canvasId === canvasId ? undefined : item)
         if (activeCanvasIdRef.current === canvasId) void openCanvas(nextCanvasId ?? '')
+      } else if (change.type === 'canvas_groups_changed') {
+        const { canvasId, groups, assignment } = change.result
+        setCanvasGroups(current => ({ ...current, [canvasId]: groups }))
+        if (assignment?.artworkIds.length) {
+          const ids = new Set(assignment.artworkIds)
+          const update = (item: CanvasImage) => ids.has(item.id) ? { ...item, groupId: assignment.groupId } : item
+          if (activeCanvasIdRef.current === canvasId) setGallery(items => items.map(update))
+          setCanvasItems(items => items[canvasId] ? { ...items, [canvasId]: items[canvasId].map(update) } : items)
+        }
       } else if (change.type === 'artwork_created') {
         showGeneratedArtwork(change.result)
       } else if (change.type === 'artwork_moved') {
@@ -167,21 +190,51 @@ export default function App() {
   const toggleCanvas = async (id: string) => {
     if (expandedCanvasIds.includes(id)) { setExpandedCanvasIds(items => items.filter(item => item !== id)); return }
     setExpandedCanvasIds(items => [...items, id])
+    if (canvasGroups[id] && canvasItems[id]) return
     try {
-      const artworks = id === activeCanvasId ? gallery : await readWorkspace(() => window.studio.listArtworks(id))
+      const [artworks, grouping] = await readWorkspace(() => Promise.all([window.studio.listArtworks(id), window.studio.listArtworkGroups(id)]))
       setCanvasItems(items => ({ ...items, [id]: mergeArtworks(artworks, items[id] || []) }))
+      setCanvasGroups(groups => ({ ...groups, [id]: grouping.groups }))
     } catch (error) { setToast(error instanceof Error ? error.message : '图片列表加载失败') }
   }
 
   const openArtwork = async (canvasId: string, artworkId: string) => {
     if (canvasId !== activeCanvasId) await openCanvas(canvasId)
     setSelectedIds([artworkId])
-    setFocusArtwork({ id: artworkId, sequence: Date.now() })
+    setFocusArtworks({ ids: [artworkId] })
     setSidebarOpen(false)
   }
 
+  const focusGroup = async (canvasId: string, ids: string[]) => {
+    if (canvasId !== activeCanvasIdRef.current) await openCanvas(canvasId)
+    if (canvasId !== activeCanvasIdRef.current) return
+    setSelectedIds(ids)
+    setFocusArtworks({ ids, fit: true })
+    setSidebarOpen(false)
+  }
+
+  const changeGroups = async (input: ArtworkGroupChangeInput) => {
+    try { await window.studio.changeArtworkGroups(input) }
+    catch (error) {
+      setToast(error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '') : '分组操作失败')
+    }
+  }
+
+  const assignSelection = () => {
+    if (!activeCanvasId || !selectedIds.length) return
+    const chosen = gallery.filter(item => selectedIds.includes(item.id))
+    if (!chosen.length) return
+    const groupId = chosen[0].groupId ?? null
+    setGroupDialog({ type: 'assign', canvasId: activeCanvasId, artworkIds: chosen.map(item => item.id),
+      groupId: chosen.every(item => (item.groupId ?? null) === groupId) ? groupId : null })
+  }
+
   const showCreateDialog = () => {
-    setCanvasName(`无限画布 ${canvases.length + 1}`)
+    const names = new Set(canvases.map(canvas => canvas.name))
+    let number = 1
+    let name = '画布'
+    while (names.has(name)) name = `画布 ${++number}`
+    setCanvasName(name)
     setCreateDialogOpen(true)
   }
 
@@ -196,12 +249,13 @@ export default function App() {
       activeCanvasIdRef.current = canvas.id
       setActiveCanvasId(canvas.id)
       setGallery([])
+      setFocusArtworks(undefined)
       setLoadingCanvas(false)
       setSelectedIds([])
       setSidebarOpen(false)
       setCreateDialogOpen(false)
       setCanvasName('')
-      setToast('已新建无限画布')
+      setToast('已新建画布')
     } catch (error) { setToast(error instanceof Error ? error.message : '新建画布失败') }
     finally { setCreating(false) }
   }
@@ -216,7 +270,7 @@ export default function App() {
 
   const showCanvasActions = (canvasId: string, x: number, y: number, artwork?: CanvasImage) => {
     setContextMenu({ canvasId, x: Math.max(8, Math.min(x, window.innerWidth - 200)),
-      y: Math.max(8, Math.min(y, window.innerHeight - (artwork ? 166 : 130))), artwork })
+      y: Math.max(8, Math.min(y, window.innerHeight - (artwork ? 202 : 166))), artwork })
   }
 
   useEffect(() => {
@@ -322,7 +376,6 @@ export default function App() {
   return <div className="flex h-full flex-col bg-background">
     <header className="drag-region flex h-14 shrink-0 items-center gap-1 border-b bg-card/70 pl-[76px] pr-2 backdrop-blur-xl md:pl-20 md:pr-5">
       <Button variant="ghost" size="icon" onClick={() => setSidebarOpen(open => !open)} aria-label="画布列表" aria-expanded={sidebarOpen} aria-controls="canvas-list" className="no-drag h-10 w-10 shrink-0 md:hidden"><Menu className="h-5 w-5" /></Button>
-      <img src={logo} alt="出图" draggable={false} className="pointer-events-none h-10 min-w-0 w-auto select-none object-contain object-left" />
       <div className="no-drag ml-auto flex shrink-0 items-center gap-0.5 sm:gap-2">
         <Button variant="ghost" size="sm" onClick={() => setMcpOpen(true)} title="Agent 接入（MCP）" aria-label="Agent 接入（MCP）" className="max-sm:h-10 max-sm:w-10 max-sm:px-0"><Plug className="h-4 w-4" /><span className="hidden sm:inline">MCP</span></Button>
         <Button variant="ghost" size="icon" onClick={() => setConfigOpen(true)} title="模型配置"><Settings2 className="h-4 w-4" /></Button>
@@ -333,8 +386,8 @@ export default function App() {
       {sidebarOpen && <button type="button" tabIndex={-1} aria-label="关闭画布列表" className="fixed inset-0 top-14 z-30 bg-slate-950/30 md:hidden" onClick={() => setSidebarOpen(false)} />}
       <aside id="canvas-list" className={`${sidebarOpen ? 'flex' : 'hidden'} fixed bottom-0 left-0 top-14 z-40 w-80 max-w-[calc(100%_-_2rem)] shrink-0 flex-col border-r bg-white shadow-xl md:static md:flex md:shadow-none`}>
         <div className="flex h-14 shrink-0 items-center justify-between border-b px-4">
-          <div><h1 className="text-sm font-semibold text-slate-900">无限画布</h1><p className="mt-0.5 text-[10px] text-slate-400">{canvases.length} 个画布</p></div>
-          <div className="flex items-center gap-2"><Button size="sm" onClick={showCreateDialog} disabled={creating} className="h-9 bg-slate-900 px-3 text-xs hover:bg-slate-800">{creating ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}新建</Button><Button variant="ghost" size="icon" aria-label="收起画布列表" onClick={() => setSidebarOpen(false)} className="md:hidden"><X className="h-4 w-4" /></Button></div>
+          <img src={logo} alt="出图" draggable={false} className="pointer-events-none h-7 w-auto select-none object-contain" />
+          <Button variant="ghost" size="icon" aria-label="收起画布列表" onClick={() => setSidebarOpen(false)} className="md:hidden"><X className="h-4 w-4" /></Button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-3">
           <div className="space-y-2">
@@ -352,37 +405,57 @@ export default function App() {
                     <span className={`flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg ${canvas.coverSrc ? 'border bg-slate-100' : active ? 'bg-violet-600 text-white shadow-md shadow-violet-200' : 'border bg-white text-slate-400 group-hover:text-slate-600'}`}>{canvas.coverSrc ? <img src={canvas.coverSrc} alt="画布封面" className="h-full w-full object-cover" /> : <LayoutDashboard className="h-4 w-4" />}</span>
                     <span className="min-w-0 flex-1"><span className={`block truncate text-xs font-medium ${active ? 'text-violet-950' : 'text-slate-700'}`}>{canvas.name}</span><span className="mt-1 block text-[10px] text-slate-400">{canvas.artworkCount ? `${canvas.artworkCount} 个作品` : '空画布'} · {formatTime(canvas.updatedAt)}</span></span>
                   </button>
-                  {!!canvas.artworkCount && <Button size="icon" variant="ghost" aria-label={`${expanded ? '收起' : '展开'}「${canvas.name}」的作品`} aria-expanded={expanded} onClick={() => toggleCanvas(canvas.id)} className="h-10 w-10 shrink-0 text-slate-500 md:h-7 md:w-7">{expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}</Button>}
+                  <Button size="icon" variant="ghost" aria-label={`${expanded ? '收起' : '展开'}「${canvas.name}」的作品`} aria-expanded={expanded} onClick={() => toggleCanvas(canvas.id)} className="h-10 w-10 shrink-0 text-slate-500 md:h-7 md:w-7">{expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}</Button>
                 </div>
-                {expanded && <div className="ml-5 mt-1 space-y-1 border-l border-violet-100 pl-3">{artworks.map(artwork => <button key={artwork.id} onClick={() => openArtwork(canvas.id, artwork.id)} className={`flex w-full items-center gap-2 rounded-lg p-1.5 text-left transition hover:bg-slate-50 ${selectedIds.includes(artwork.id) && active ? 'bg-violet-50 text-violet-700' : 'text-slate-600'}`}><img src={artwork.src} alt={artwork.prompt || '图片'} className="h-8 w-8 shrink-0 rounded-md border bg-slate-100 object-cover" /><span className="min-w-0 flex-1 truncate text-[10px]">{artwork.prompt || '未命名图片'}</span></button>)}{!artworks.length && <div className="px-2 py-2 text-[10px] text-slate-400">暂无图片</div>}</div>}
+                {expanded && <CanvasArtworkGroups groups={canvasGroups[canvas.id] ?? []}
+                  artworks={artworks} selectedIds={active ? selectedIds : []}
+                  onOpenArtwork={artworkId => void openArtwork(canvas.id, artworkId)}
+                  onFocusGroup={ids => void focusGroup(canvas.id, ids)}
+                  onRename={group => setGroupDialog({ type: 'rename', canvasId: canvas.id, group })}
+                  onDelete={group => setGroupDialog({ type: 'delete', canvasId: canvas.id, group })}
+                  onReorder={groupIds => void changeGroups({ type: 'reorder', canvasId: canvas.id, groupIds })}
+                  onAssign={(artworkIds, groupId) => void changeGroups({ type: 'assign', canvasId: canvas.id, artworkIds, groupId })} />}
               </div>
             })}
           </div>
         </div>
-        <div className="border-t p-3"><Button variant="outline" className="h-10 w-full border-dashed text-xs text-slate-600" onClick={showCreateDialog} disabled={creating}><Plus className="h-4 w-4" />新建无限画布</Button></div>
+        <div className="border-t p-3"><Button variant="outline" className="h-10 w-full border-dashed text-xs text-slate-600" onClick={showCreateDialog} disabled={creating}><Plus className="h-4 w-4" />新建画布</Button></div>
       </aside>
 
       <main className="flex min-w-0 flex-1 flex-col bg-slate-50">
         <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b bg-white px-3 md:px-5">
-          <div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-semibold">{activeCanvas?.name || '无限画布'}</span><span className="hidden shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500 min-[420px]:inline">{selectedIds.length > 1 ? `已选择 ${selectedIds.length} 项` : gallery.length ? `${gallery.length} 个作品` : '空画布'}</span></div>
+          <div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-semibold">{activeCanvas?.name || '画布'}</span><span className="hidden shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500 min-[420px]:inline">{selectedIds.length > 1 ? `已选择 ${selectedIds.length} 项` : gallery.length ? `${gallery.length} 个作品` : '空画布'}</span></div>
           <div className="flex shrink-0 items-center gap-1 sm:gap-2">
+            {selectedIds.length > 0 && <Button size="sm" variant="outline" aria-label="移动到分组" title="移动到分组"
+              onClick={assignSelection} className="max-sm:h-10 max-sm:w-10 max-sm:px-0"><FolderInput className="size-3.5" /><span className="hidden sm:inline">分组</span></Button>}
             {selected && <><Button size="sm" variant="outline" onClick={() => setEditing(selected)} className="max-sm:h-10"><Brush className="h-3.5 w-3.5" />编辑</Button><Button size="sm" variant="outline" aria-label="保存图片" title="保存图片" onClick={() => saveDirect(selected.src)} className="max-sm:h-10 max-sm:w-10 max-sm:px-0"><Download className="h-3.5 w-3.5" /><span className="hidden sm:inline">保存</span></Button></>}
             {activeCanvasId && <Button size="icon" variant="ghost" aria-label="画布操作" title="画布操作" onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); showCanvasActions(activeCanvasId, rect.right - 192, rect.bottom + 4, selected) }} className="h-10 w-10"><Ellipsis className="h-5 w-5" /></Button>}
           </div>
         </div>
         <div className="relative min-h-0 flex-1">
           <input ref={fileInput} type="file" accept="image/*" hidden onChange={event => { importFile(event.target.files?.[0], uploadCanvasId || activeCanvasId); setUploadCanvasId(undefined); event.target.value = '' }} />
-          {activeCanvasId && <InfiniteCanvas key={activeCanvasId} items={gallery} selectedIds={selectedIds} focusArtwork={focusArtwork} onSelect={setSelectedIds} onMove={moveItems} onMoveEnd={commitMoves} onEdit={setEditing} onDelete={setDeletingArtwork} onUpload={() => requestUpload(activeCanvasId)} />}
-          {!activeCanvasId && !loadingCanvas && <div className="absolute inset-0 grid place-items-center p-4"><Button variant="outline" onClick={showCreateDialog}><Plus className="h-4 w-4" />新建无限画布</Button></div>}
+          {activeCanvasId && <InfiniteCanvas key={activeCanvasId} items={gallery} groups={canvasGroups[activeCanvasId] ?? []}
+            selectedIds={selectedIds} focusArtworks={focusArtworks} onSelect={setSelectedIds} onMove={moveItems}
+            onMoveEnd={commitMoves} onEdit={setEditing} onDelete={setDeletingArtwork} onUpload={() => requestUpload(activeCanvasId)} />}
+          {!activeCanvasId && !loadingCanvas && <div className="absolute inset-0 grid place-items-center p-4"><Button variant="outline" onClick={showCreateDialog}><Plus className="h-4 w-4" />新建画布</Button></div>}
           {loadingCanvas && <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-50/70 backdrop-blur-sm"><div className="flex items-center gap-2 rounded-full border bg-white px-4 py-2 text-xs text-slate-500 shadow-lg"><LoaderCircle className="h-3.5 w-3.5 animate-spin" />正在加载画布…</div></div>}
         </div>
       </main>
     </div>
     <ModelDialog open={configOpen} models={models} onClose={() => setConfigOpen(false)} onSave={saveModels} />
     {mcpOpen && <McpDialog onClose={() => setMcpOpen(false)} />}
+    {groupDialog && <ArtworkGroupDialog dialog={groupDialog} groups={canvasGroups[groupDialog.canvasId] ?? []}
+      onClose={() => setGroupDialog(undefined)} onSaved={result => {
+        if (groupDialog.type === 'create') {
+          if (!expandedCanvasIds.includes(result.canvasId)) void toggleCanvas(result.canvasId)
+          setToast('分组已创建')
+        } else if (groupDialog.type === 'assign') setToast('图片分组已更新')
+        setGroupDialog(undefined)
+      }} />}
     {contextMenu && <div className="fixed inset-0 z-[60]" onMouseDown={() => setContextMenu(undefined)} onContextMenu={event => { event.preventDefault(); setContextMenu(undefined) }}>
       <div className="absolute w-48 rounded-xl border bg-white p-1.5 shadow-xl shadow-slate-900/15" style={{ left: contextMenu.x, top: contextMenu.y }} onMouseDown={event => event.stopPropagation()}>
         <button onClick={() => showRenameDialog(contextMenu.canvasId)} className="flex h-9 w-full items-center gap-2.5 rounded-lg px-3 text-left text-xs text-slate-700 hover:bg-slate-100"><Pencil className="h-3.5 w-3.5 text-slate-400" />修改画布名称</button>
+        <button onClick={() => { setGroupDialog({ type: 'create', canvasId: contextMenu.canvasId }); setContextMenu(undefined) }} className="flex h-9 w-full items-center gap-2.5 rounded-lg px-3 text-left text-xs text-slate-700 hover:bg-violet-50 hover:text-violet-700"><FolderPlus className="size-3.5 text-slate-400" />新建分组</button>
         <button onClick={() => showImageDialog(contextMenu.canvasId)} className="flex h-9 w-full items-center gap-2.5 rounded-lg px-3 text-left text-xs text-slate-700 hover:bg-violet-50 hover:text-violet-700"><ImagePlus className="h-3.5 w-3.5 text-slate-400" />新建图片</button>
         <button onClick={() => requestUpload(contextMenu.canvasId)} className="flex h-9 w-full items-center gap-2.5 rounded-lg px-3 text-left text-xs text-slate-700 hover:bg-slate-100"><Upload className="h-3.5 w-3.5 text-slate-400" />上传图片</button>
         {contextMenu.artwork && <button onClick={() => { setDeletingArtwork(contextMenu.artwork); setContextMenu(undefined) }} className="flex h-9 w-full items-center gap-2.5 rounded-lg px-3 text-left text-xs text-red-600 hover:bg-red-50"><Trash2 className="h-3.5 w-3.5" />删除选中图片</button>}
@@ -390,7 +463,7 @@ export default function App() {
     </div>}
     {createDialogOpen && <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/25 p-3 backdrop-blur-[2px] sm:p-6" onMouseDown={event => { if (event.target === event.currentTarget && !creating) setCreateDialogOpen(false) }}>
       <form onSubmit={event => { event.preventDefault(); createCanvas() }} className="max-h-full w-full max-w-sm overflow-y-auto rounded-2xl border bg-white p-4 shadow-2xl shadow-slate-950/20 sm:p-5">
-        <div className="mb-5"><div className="mb-1 text-base font-semibold text-slate-900">新建无限画布</div><p className="text-xs leading-5 text-slate-500">给画布起一个容易识别的名称，之后可以在左侧列表中切换。</p></div>
+        <div className="mb-5"><div className="mb-1 text-base font-semibold text-slate-900">新建画布</div><p className="text-xs leading-5 text-slate-500">给画布起一个容易识别的名称，之后可以在左侧列表中切换。</p></div>
         <label htmlFor="canvas-name" className="mb-2 block text-xs font-medium text-slate-700">画布名称</label>
         <Input id="canvas-name" autoFocus value={canvasName} onChange={event => setCanvasName(event.target.value)} onKeyDown={event => { if (event.key === 'Escape' && !creating) setCreateDialogOpen(false) }} placeholder="例如：秋季新品视觉" className="h-10" />
         <div className="mt-5 flex justify-end gap-2"><Button type="button" variant="ghost" onClick={() => setCreateDialogOpen(false)} disabled={creating}>取消</Button><Button type="submit" disabled={!canvasName.trim() || creating} className="bg-violet-600 hover:bg-violet-700">{creating && <LoaderCircle className="h-4 w-4 animate-spin" />}创建画布</Button></div>
@@ -426,7 +499,7 @@ export default function App() {
         <div className="mt-5 flex justify-end gap-2"><Button variant="ghost" onClick={() => setDeletingArtwork(undefined)} disabled={deleting}>取消</Button><Button onClick={deleteArtwork} disabled={deleting} className="bg-red-600 text-white hover:bg-red-700">{deleting ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}确认删除</Button></div>
       </div>
     </div>}
-    {editing && <ImageEditor artwork={editing} models={models} onClose={() => setEditing(undefined)} onSaved={path => { setToast(`已保存到 ${path}`); setEditing(undefined) }} />}
+    {editing && <ImageEditor key={editing.id} artwork={editing} models={models} onVersionChange={setViewedVersion} onClose={() => { setEditing(undefined); setViewedVersion(undefined) }} onSaved={path => setToast(`已保存到 ${path}`)} />}
     {toast && <div className="fixed bottom-5 left-1/2 z-[80] w-max max-w-[calc(100%_-_1.5rem)] -translate-x-1/2 break-words rounded-lg border bg-card px-4 py-2.5 text-xs shadow-2xl sm:max-w-xl">{toast}</div>}
   </div>
 }

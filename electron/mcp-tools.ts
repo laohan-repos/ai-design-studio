@@ -4,9 +4,15 @@ import { z } from 'zod'
 import { productName } from '../package.json'
 import type { ArtworkVersion, CanvasGeneration, GeneratedArtwork, McpWorkspaceChange } from '../src/types'
 import type { StudioDatabase } from './database'
-import { posterEdit, posterId, posterOutput } from '../src/lib/poster'
+import { posterEdit, posterId, posterMaskPreviewInput, posterOutput } from '../src/lib/poster'
+import { posterPixelInput, posterPixelPaintInput, posterRegionInput, type PosterRegionInput, type PosterRegionPreview } from '../src/lib/poster-pixels'
 import type { PosterService } from './poster-service'
 import { retouchInput, type RetouchResult } from '../src/lib/retouch'
+import { inspectColorsInput, inspectPhotoInput, photoRecipeInput, previewMaskInput, previewPhotoEditInput, suggestPhotoCropsInput } from '../src/lib/photo-edits'
+import type { describeEditorContext, PhotoEdits } from './photo-edits'
+import { readLocalImage } from './local-image'
+import { assignArtworksToGroupInput, createArtworkGroupInput, deleteArtworkGroupInput, listArtworkGroupsInput,
+  renameArtworkGroupInput, reorderArtworkGroupsInput, type ArtworkGroupChangeInput, type CanvasGroupingChange } from '../src/lib/canvas-groups'
 
 type Job = {
   jobId: string
@@ -18,6 +24,7 @@ type Job = {
 
 type JobEntry = { job: Job; requestId?: string; inputKey: string }
 type PrepareGeneration = (input: CanvasGeneration) => () => Promise<GeneratedArtwork>
+type ChangeArtworkGroups = (input: ArtworkGroupChangeInput) => Promise<CanvasGroupingChange>
 
 const id = z.string().trim().min(1).max(128)
 const canvasName = z.string().trim().min(1).max(100)
@@ -30,16 +37,80 @@ const success = (data: Record<string, unknown>) => ({
   content: [{ type: 'text' as const, text: JSON.stringify(data) }]
 })
 
+type RedrawInput = Extract<PosterRegionInput, { mode: 'redraw' }>
+type RegionJob = {
+  jobId: string
+  requestId?: string
+  inputKey: string
+  status: 'running' | 'completed' | 'failed'
+  preview?: PosterRegionPreview
+  error?: string
+  finishedAt?: number
+}
+
+const regionJobLimit = 8
+const regionJobLifetime = 5 * 60_000
+
+function createRegionJobs(posters: PosterService) {
+  const jobs = new Map<string, RegionJob>()
+
+  function prune() {
+    const now = Date.now()
+    for (const [jobId, job] of jobs) {
+      if (job.finishedAt && now - job.finishedAt >= regionJobLifetime) jobs.delete(jobId)
+    }
+  }
+
+  function submit(input: RedrawInput, requestId?: string) {
+    prune()
+    const inputKey = JSON.stringify(input)
+    const previous = requestId && [...jobs.values()].find(job => job.requestId === requestId)
+    if (previous) {
+      if (previous.inputKey !== inputKey) throw new Error('该 requestId 已用于不同的重绘参数')
+      return { jobId: previous.jobId, status: previous.status }
+    }
+    if ([...jobs.values()].filter(job => job.status === 'running').length >= 2) {
+      throw new Error('正在生成其他局部重绘预览，请稍候重试')
+    }
+    if (jobs.size >= regionJobLimit) {
+      const oldest = [...jobs.values()].find(job => job.status !== 'running')
+      if (oldest) jobs.delete(oldest.jobId)
+    }
+    const job: RegionJob = { jobId: randomUUID(), requestId, inputKey, status: 'running' }
+    jobs.set(job.jobId, job)
+    void posters.previewLayerRegion(input).then(preview => {
+      job.preview = preview
+      job.status = 'completed'
+    }, () => {
+      job.error = '局部重绘失败，请检查图生图连接、选区和海报版本后重试。'
+      job.status = 'failed'
+    }).finally(() => { job.finishedAt = Date.now() })
+    return { jobId: job.jobId, status: job.status }
+  }
+
+  function get(jobId: string) {
+    prune()
+    const job = jobs.get(jobId)
+    if (!job) throw new Error('找不到该局部重绘任务，任务仅在当前进程内短期保留')
+    return job
+  }
+
+  return { submit, get }
+}
+
 export function createStudioMcpTools(
   database: StudioDatabase,
   prepareGeneration: PrepareGeneration,
   publish: (change: McpWorkspaceChange) => void,
   posters: PosterService,
-  portrait: { retouch(input: unknown): Promise<RetouchResult>; applyVersion(artworkId: string, versionId: string): Promise<ArtworkVersion> }
+  portrait: { retouch(input: unknown): Promise<RetouchResult>; applyVersion(artworkId: string, versionId: string): Promise<ArtworkVersion> },
+  photo: { photoEdits: PhotoEdits; editorContext: () => ReturnType<typeof describeEditorContext> },
+  changeArtworkGroups: ChangeArtworkGroups
 ) {
   const jobs = new Map<string, JobEntry>()
   let queue = Promise.resolve()
   let pending = 0
+  const regionJobs = createRegionJobs(posters)
 
   function submitGeneration(input: CanvasGeneration, requestId?: string): Job {
     const inputKey = JSON.stringify(input)
@@ -79,7 +150,7 @@ export function createStudioMcpTools(
 
   return () => {
     const server = new McpServer({ name: 'ai-design-studio', title: productName, version: '1.0.0' }, {
-      instructions: '先列出画布并按 ID 选择目标。做海报时先打开海报，再按最新 revision 编辑，可预览或导出。generate_image 会调用已配置的文生图模型，提交后请用 get_image_job 查询原任务。'
+      instructions: '用户说“这张”时用 get_editor_context 确定目标；按名称可用 list_canvases 和 list_artworks。整理图片先用 list_artwork_groups 查现有分组，按任务自定名称并优先复用合适的分组，再批量归组。修图先看指定版本和局部，再用 preview_photo_edit 返回对比。黄金构图先看图定位重点，通过 suggest_artwork_crop 给出裁法。用户要先看对比时停在预览，另存和应用各有独立工具。做海报时先打开海报，再按最新 revision 编辑。像素编辑先用 inspect_poster_layer_pixels 看目标图层。用 preview_poster_layer_region 预览移除或提交重绘，再用 get_poster_region_job 查询重绘预览。确认后用 save_poster_layer_region 应用。generate_image 调用已配置的文生图模型，用 get_image_job 查询任务。'
     })
     server.registerTool('list_canvases', {
       description: '列出本机应用的画布、画布 ID 和作品数量。', annotations: readOnly
@@ -113,14 +184,32 @@ export function createStudioMcpTools(
     })
 
     server.registerTool('list_artworks', {
-      description: '列出指定画布的图片 ID、提示词和位置，支持分页。',
-      inputSchema: { canvasId: id, limit: z.number().int().min(1).max(100).default(30), offset: z.number().int().min(0).default(0) },
+      description: '列出指定画布的图片 ID、提示词、位置和分组。可分页并按分组筛选。',
+      inputSchema: { canvasId: id, limit: z.number().int().min(1).max(100).default(30), offset: z.number().int().min(0).default(0),
+        groupId: id.nullable().optional().describe('省略时列出所有图片，传 null 只列未分组图片') },
       annotations: readOnly
-    }, ({ canvasId, limit, offset }) => {
-      const total = database.getCanvasArtworkCount(canvasId)
+    }, ({ canvasId, limit, offset, groupId }) => {
+      if (groupId && !database.listArtworkGroups(canvasId).groups.some(group => group.id === groupId)) throw new Error('分组不在指定画布中')
+      const total = database.getCanvasArtworkCount(canvasId, groupId)
       if (total === undefined) throw new Error('画布不存在')
-      const artworks = database.listArtworkMetadata(canvasId, limit, offset)
+      const artworks = database.listArtworkMetadata(canvasId, limit, offset, groupId)
       return success({ canvasId, artworks, total, nextOffset: offset + artworks.length < total ? offset + artworks.length : null })
+    })
+    registerArtworkGroupTools(server, database, changeArtworkGroups)
+
+    server.registerTool('import_local_image', {
+      description: '将本机的 PNG、JPEG 或 WebP 图片导入指定画布，最大 20 MB。先用 list_canvases 确认画布 ID，再传入用户指定的本机绝对路径。返回图片 ID 和像素尺寸。',
+      inputSchema: {
+        canvasId: id,
+        filePath: z.string().min(1).max(4096).describe('图片在运行出图的电脑上的绝对文件路径')
+      },
+      annotations: localUpdate
+    }, async ({ canvasId, filePath }) => {
+      if (database.getCanvasArtworkCount(canvasId) === undefined) throw new Error('画布不存在')
+      const { src, filename, ...metadata } = await readLocalImage(filePath)
+      const result = await database.addArtwork({ canvasId, src, prompt: filename })
+      publish({ type: 'artwork_created', result })
+      return success({ canvasId, artworkId: result.artwork.id, filename, ...metadata })
     })
 
     server.registerTool('move_artwork', {
@@ -161,10 +250,11 @@ export function createStudioMcpTools(
       if (!entry) throw new Error('任务不存在。任务状态仅在当前应用进程中保留。')
       return success({ ...entry.job })
     })
-    registerPosterTools(server, posters)
+    registerPosterTools(server, database, posters, regionJobs)
+    registerPhotoTools(server, photo.photoEdits, photo.editorContext)
     server.registerTool('retouch_portrait', {
-      description: '按 Agent 提供的策略在本机精调照片。先用 get_artwork_preview 看图，再选择适合的磨皮和提亮强度，建议自然磨皮从 20–40 开始。可按原图归一化坐标框选某张脸。结果保存为新版本，生成后可用 versionId 预览或手动应用。',
-      inputSchema: retouchInput.extend({ smoothing: retouchInput.shape.smoothing.unwrap() }),
+      description: '先用 get_artwork_preview 看指定版本，再在本机做自然磨皮、提亮、减轻眼下阴影、均匀两颊肤色或压白纱高光。各项可单独使用。可框选一张脸；压白纱高光须沿白纱圈选归一化多边形。结果另存版本，返回 versionId 用于预览。',
+      inputSchema: retouchInput.extend({ smoothing: retouchInput.shape.smoothing.unwrap().default(0) }),
       annotations: { destructiveHint: false, openWorldHint: false }
     }, async input => {
       const { version, ...metadata } = await portrait.retouch(input)
@@ -185,9 +275,117 @@ export function createStudioMcpTools(
   }
 }
 
-function registerPosterTools(server: McpServer, posters: PosterService) {
+function registerArtworkGroupTools(server: McpServer, database: StudioDatabase, change: ChangeArtworkGroups) {
+  server.registerTool('list_artwork_groups', {
+    description: '按顺序列出指定画布的分组及每组图片数，包含未分组的图片数量。',
+    inputSchema: listArtworkGroupsInput, annotations: readOnly,
+  }, ({ canvasId }) => success(database.listArtworkGroups(canvasId)))
+
+  server.registerTool('create_artwork_group', {
+    description: '在指定画布新建一个空分组，返回 groupId。分组名由用户或 Agent 按任务决定。',
+    inputSchema: createArtworkGroupInput, annotations: localUpdate,
+  }, async input => success(await change({ type: 'create', ...input })))
+
+  server.registerTool('rename_artwork_group', {
+    description: '修改指定画布内某个分组的名称。',
+    inputSchema: renameArtworkGroupInput, annotations: { ...localUpdate, idempotentHint: true },
+  }, async input => success(await change({ type: 'rename', ...input })))
+
+  server.registerTool('reorder_artwork_groups', {
+    description: '调整画布内分组的顺序。先查询分组，再按期望顺序提交全部分组 ID。',
+    inputSchema: reorderArtworkGroupsInput, annotations: { ...localUpdate, idempotentHint: true },
+  }, async input => success(await change({ type: 'reorder', ...input })))
+
+  server.registerTool('delete_artwork_group', {
+    description: '删除指定分组，组内全部图片回到未分组并保留各自的历史版本。',
+    inputSchema: deleteArtworkGroupInput, annotations: localDelete,
+  }, async input => success(await change({ type: 'delete', ...input })))
+
+  server.registerTool('assign_artworks_to_group', {
+    description: '批量把指定画布中的图片放入一个分组。groupId 传 null 时，将这些图片移回未分组。',
+    inputSchema: assignArtworksToGroupInput, annotations: { ...localUpdate, idempotentHint: true },
+  }, async input => success(await change({ type: 'assign', ...input })))
+}
+
+function photoImage(src: string) {
+  return { type: 'image' as const, mimeType: 'image/png', data: src.slice(src.indexOf(',') + 1) }
+}
+
+function registerPhotoTools(server: McpServer, photo: PhotoEdits, editorContext: () => ReturnType<typeof describeEditorContext>) {
+  server.registerTool('get_editor_context', {
+    description: '读取出图当前画布、已选图片和正在编辑的版本。优先采用编辑器或单选图片作为目标；有多个候选时结合用户指代确认。', annotations: readOnly
+  }, () => success(editorContext()))
+
+  server.registerTool('inspect_artwork', {
+    description: '查看指定版本的全图或局部高清裁切。region 使用整张原图的 0–1 坐标；元数据返回原图尺寸和裁切像素位置。',
+    inputSchema: inspectPhotoInput, annotations: readOnly
+  }, async input => {
+    const { src, ...metadata } = await photo.inspect(input)
+    return { structuredContent: metadata, content: [photoImage(src)] }
+  })
+
+  server.registerTool('inspect_photo_colors', {
+    description: '读取指定照片版本的亮度与 RGB 直方图，并按需对指定区域取样。samples 的坐标以整张源图为准。RGB、亮度取值 0–255，高光和暗部剪切以百分比返回。可先从肤色和白色布料取样，再决定调色策略。',
+    inputSchema: inspectColorsInput, annotations: readOnly
+  }, async input => success(await photo.inspectColors(input)))
+
+  server.registerTool('suggest_artwork_crop', {
+    description: '在指定版本上按 38.2% 与 61.8% 黄金网格推荐裁剪。先查看图，设定输出比例、归一化重点位置和必须保留的区域。返回最多两个裁剪框和效果图；空列表表示比例与保留区域冲突。将候选 box 交给 preview_photo_edit 的 crop 操作可生成可另存的预览。',
+    inputSchema: suggestPhotoCropsInput, annotations: readOnly
+  }, async input => {
+    const { candidates, ...metadata } = await photo.suggestCrops(input)
+    return {
+      structuredContent: { ...metadata, candidates: candidates.map(({ overlay: _guide, preview: _preview, ...candidate }) => candidate) },
+      content: candidates.length ? candidates.flatMap((item, index) => [
+        { type: 'text' as const, text: `裁法 ${index + 1} · ${item.box.width} × ${item.box.height} · 第一张为原图裁剪框，第二张为裁后效果` },
+        photoImage(item.overlay), photoImage(item.preview)
+      ]) : [{ type: 'text' as const, text: '当前比例无法完整保留指定区域，可以换比例或调整保护范围。' }]
+    }
+  })
+
+  server.registerTool('get_photo_edit_recipe', {
+    description: '读取已经另存的调色或裁剪版本使用的配方，包含底图 versionId、操作和裁剪框。可以从底图调整配方并重新预览。',
+    inputSchema: photoRecipeInput, annotations: readOnly
+  }, input => success({ recipe: photo.recipe(input) }))
+
+  server.registerTool('preview_photo_mask', {
+    description: '在源图上叠加显示局部修图选区。支持矩形、椭圆、多边形和笔刷，include 加选，exclude 减选保护，feather 羽化。include 取空数组时先选整图再扣除保护区域。所有坐标相对于整张源图。',
+    inputSchema: previewMaskInput, annotations: readOnly
+  }, async input => {
+    const { src, ...metadata } = await photo.previewMask(input)
+    return { structuredContent: metadata, content: [photoImage(src)] }
+  })
+
+  server.registerTool('preview_photo_edit', {
+    description: '按顺序执行调色、纹理、点修、克隆和几何编辑。裁剪（crop）可带顺时针拉直角度 angle，box 使用旋转后同尺寸画面的像素坐标。resize 缩放图像，canvas_size 按 anchor 扩展或裁切边缘。几何操作须放在最后。返回预览和临时 draftId。',
+    inputSchema: previewPhotoEditInput, annotations: localUpdate
+  }, async input => {
+    const { before, after, ...metadata } = await photo.preview(input)
+    return { structuredContent: metadata, content: [
+      { type: 'text' as const, text: metadata.cropAngle ? '拉直后的裁剪框' : metadata.cropBox ? '原图上的裁剪框' : metadata.outputSize ? '尺寸调整前' : '修图前' }, photoImage(before),
+      { type: 'text' as const, text: metadata.cropBox ? '裁剪后' : metadata.outputSize ? '尺寸调整后' : '修图后' }, photoImage(after)
+    ] }
+  })
+
+  server.registerTool('save_photo_edit_version', {
+    description: '将已预览的 draftId 另存为图片版本，返回 versionId。用户确认应用到画布时再调用 apply_artwork_version。',
+    inputSchema: { draftId: id }, annotations: { ...localUpdate, idempotentHint: true }
+  }, async ({ draftId }) => success(await photo.save(draftId)))
+}
+
+function registerPosterTools(server: McpServer, database: StudioDatabase, posters: PosterService, regionJobs: ReturnType<typeof createRegionJobs>) {
   const localEdit = { destructiveHint: false, openWorldHint: false }
   const target = { artworkId: posterId }
+
+  server.registerTool('get_editor_history', {
+    description: '读取指定图片的编辑时间线、当前 cursor 和历史 revision。时间线也记录图层变换、蒙版、尺寸、像素笔画和局部重绘。',
+    inputSchema: target, annotations: readOnly
+  }, ({ artworkId }) => success({ history: posters.getEditorHistory(artworkId) }))
+
+  server.registerTool('navigate_editor_history', {
+    description: '使用 get_editor_history 返回的历史 revision 跳到指定步骤。cursor 从 0 开始，向前或向后跳转可重做或撤销。',
+    inputSchema: { ...target, revision: z.number().int().min(1), cursor: z.number().int().min(0) }, annotations: localEdit
+  }, async ({ artworkId, revision, cursor }) => success({ history: await posters.navigateEditorHistory(artworkId, revision, cursor) }))
 
   server.registerTool('get_artwork_preview', {
     description: '返回原图的 PNG 缩略图。绘制蒙版前，传入 open_poster 返回的 sourceVersionId 查看海报绑定的原图版本。',
@@ -198,17 +396,74 @@ function registerPosterTools(server: McpServer, posters: PosterService) {
   })
 
   server.registerTool('open_poster', {
-    description: '创建或打开某张图片的可编辑海报，返回背景、主体蒙版、阴影、文字图层及 revision。versionId 只在首次创建时选择源版本。',
+    description: '创建或打开某张图片的可编辑海报，返回背景、主体蒙版、阴影、图片和文字图层、从底到顶的 layerOrder 及 revision。versionId 只在首次创建时选择主体源版本。',
     inputSchema: { ...target, versionId: posterId.optional() }, annotations: localEdit
   }, async ({ artworkId, versionId }) => success({ poster: await posters.open(artworkId, versionId) }))
 
   server.registerTool('edit_poster', {
-    description: '使用最新 revision 批量修改海报图层。位置、字号和尺寸以画布像素计。抠图用 edge_color 去除从边缘连通的近似纯色，或用 polygon 传入相对于整张原图的 0–1 坐标。upsert_text 用相同 id 修改原文字层。',
+    description: '使用海报最新 revision 批量编辑。set_size 缩放排版，set_canvas_size 按 anchor 调整边缘并保持图层大小。set_image 支持位置、宽高、旋转和不透明度，主体拉伸使用 set_subject 的 stretch。add_image 将图片置于顶层，reorder_layers 传入从底到顶的全部前景图层 ID。set_layer_mask 创建蒙版、从选区转换或移除蒙版，paint_layer_mask 用 hide 和 restore 修边。set_mask 支持主体的纯色抠图或多边形描边。',
     inputSchema: posterEdit, annotations: localEdit
   }, async input => success({ poster: await posters.edit(input) }))
 
+  server.registerTool('list_image_edit_models', {
+    description: '列出已配置的图生图模型的 ID、名称、服务商和模型标识。局部重绘的 modelId 使用其中返回的 id。',
+    annotations: readOnly
+  }, () => success({ models: database.listModels()
+    .filter(model => model.taskType === 'image-to-image' && model.apiKey.trim() && model.model.trim())
+    .map(({ id, name, provider, model }) => ({ id, name, provider, model })) }))
+
+  server.registerTool('inspect_poster_layer_pixels', {
+    description: '查看当前图层的像素预览及原始像素尺寸。先用 open_poster 读取最新 revision。layerId 可用 subject、image:<图层 ID> 或图片 background。坐标相对于未变换的图层。',
+    inputSchema: posterPixelInput, annotations: readOnly
+  }, async input => {
+    const { src, ...metadata } = await posters.inspectLayerPixels(input)
+    return { structuredContent: metadata, content: [photoImage(src)] }
+  })
+
+  server.registerTool('preview_poster_layer_mask', {
+    description: '查看指定图片图层的当前像素及蒙版透明度。第一张图为图层像素，第二张图的透明区域表示被蒙版隐藏的位置。',
+    inputSchema: posterMaskPreviewInput, annotations: readOnly
+  }, async ({ artworkId, layerId, revision }) => {
+    const { source, mask, ...metadata } = await posters.previewLayerMask(artworkId, layerId, revision)
+    return { structuredContent: metadata, content: [photoImage(source), photoImage(mask)] }
+  })
+
+  server.registerTool('paint_poster_layer_pixels', {
+    description: '在当前图层提交一笔画笔、橡皮擦或连续仿制图章。points 是相对于整层原始像素的连续 0–1 坐标，radius 相对于短边。图章用 source 作为取样起点。每笔可通过编辑历史撤销。',
+    inputSchema: posterPixelPaintInput, annotations: localEdit
+  }, async input => success({ poster: await posters.paintLayerPixels(input) }))
+
+  const [removeInput, redrawInput] = posterRegionInput.options
+  server.registerTool('preview_poster_layer_region', {
+    description: '预览选区内的物体移除或重绘。remove 在本机处理并返回图片和 draftId。redraw 使用已配置的图生图模型，可能产生费用，返回 jobId 后用 get_poster_region_job 查询。重试同一次重绘时复用 requestId。两种预览都须另行应用。',
+    inputSchema: z.discriminatedUnion('mode', [removeInput, redrawInput.extend({ requestId: id.optional() })]),
+    annotations: { destructiveHint: false, openWorldHint: true }
+  }, async input => {
+    if (input.mode === 'redraw') {
+      const { requestId, ...redraw } = input
+      return success(regionJobs.submit(redraw, requestId))
+    }
+    const { src, ...metadata } = await posters.previewLayerRegion(input)
+    return { structuredContent: metadata, content: [photoImage(src)] }
+  })
+
+  server.registerTool('get_poster_region_job', {
+    description: '查询局部重绘任务。完成后返回预览 PNG 和 draftId，确认后用 save_poster_layer_region 应用。',
+    inputSchema: { jobId: id }, annotations: readOnly
+  }, ({ jobId }) => {
+    const job = regionJobs.get(jobId)
+    if (!job.preview) return success({ jobId, status: job.status, ...(job.error && { error: job.error }) })
+    const { src, ...metadata } = job.preview
+    return { structuredContent: { jobId, status: job.status, ...metadata }, content: [photoImage(src)] }
+  })
+
+  server.registerTool('save_poster_layer_region', {
+    description: '应用已确认的局部编辑 draftId，只把结果合入选区。海报版本变化后要重新生成预览。',
+    inputSchema: { draftId: id }, annotations: { ...localEdit, idempotentHint: true }
+  }, async ({ draftId }) => success({ poster: await posters.saveLayerRegion(draftId) }))
+
   server.registerTool('undo_poster_edit', {
-    description: '使用当前 revision 撤销上一次海报编辑，返回新 revision。',
+    description: '使用当前海报 revision 撤销这张图片编辑时间线中的上一步，返回当前海报。',
     inputSchema: { ...target, revision: z.number().int().min(1) }, annotations: localEdit
   }, async ({ artworkId, revision }) => success({ poster: await posters.undo(artworkId, revision) }))
 

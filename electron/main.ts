@@ -11,6 +11,9 @@ import { LocalMcp } from './local-mcp'
 import { createStudioMcpTools } from './mcp-tools'
 import { PosterService } from './poster-service'
 import { createPortraitRetouch } from './retouch-service'
+import { describeEditorContext, PhotoEdits } from './photo-edits'
+import { editorSelectionInput, type EditorSelection } from '../src/lib/photo-edits'
+import { artworkGroupChangeInput, listArtworkGroupsInput, type ArtworkGroupChangeInput } from '../src/lib/canvas-groups'
 import type { PosterOutput } from '../src/lib/poster'
 import type { CanvasGeneration, GeneratePayload, McpWorkspaceChange, ModelConfig } from '../src/types'
 
@@ -21,6 +24,7 @@ app.setName(productName)
 app.setPath('userData', join(app.getPath('appData'), 'lumina-ai-design-studio'))
 const isPrimaryInstance = app.requestSingleInstanceLock()
 if (!isPrimaryInstance) app.quit()
+const editorSelections = new WeakMap<Electron.WebContents, EditorSelection>()
 
 async function createWindow() {
   const win = new BrowserWindow({
@@ -33,6 +37,7 @@ async function createWindow() {
       sandbox: true
     }
   })
+  win.webContents.on('did-start-loading', () => { editorSelections.delete(win.webContents) })
   win.webContents.on('did-fail-load', (_event, code, description) => console.error('[renderer:load]', code, description))
   win.webContents.on('console-message', (_event, level, message, line, source) => console.log(`[renderer:${level}]`, message, `${source}:${line}`))
   if (process.env.ELECTRON_RENDERER_URL) await win.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -59,22 +64,63 @@ if (isPrimaryInstance) void app.whenReady().then(async () => {
       catch { /* A window can close after the data has been saved. */ }
     }
   }
-  const posters = new PosterService(database, join(app.getPath('downloads'), 'AI设计助手'), poster => publish({ type: 'poster_updated', poster }))
+  const generateRegion = async (modelId: string, prompt: string, image: Buffer, mask: Buffer) => {
+    const config = database.listModels().find(model => model.id === modelId && model.taskType === 'image-to-image')
+    if (!config) throw new Error('请在模型配置中选择可用的图生图模型')
+    const [result] = await generateImage({
+      config, prompt, image: `data:image/png;base64,${image.toString('base64')}`, size: '1024x1024', quality: 'medium', count: 1
+    }, mask)
+    const match = result?.match(/^data:image\/[\w.+-]+;base64,(.+)$/)
+    if (!match) throw new Error('模型没有返回可用的重绘图片')
+    return Buffer.from(match[1], 'base64')
+  }
+  const posters = new PosterService(database, join(app.getPath('downloads'), 'AI设计助手'),
+    poster => publish({ type: 'poster_updated', poster }), publish, generateRegion)
   const retouch = createPortraitRetouch(database, publish)
+  const photoEdits = new PhotoEdits(database, publish)
+  const editorContext = () => {
+    const window = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+    return describeEditorContext(database, window && editorSelections.get(window.webContents))
+  }
   const applyVersion = async (artworkId: string, versionId: string) => {
     const result = await database.applyArtworkVersion(artworkId, versionId)
     if (!result) throw new Error('找不到指定的图片版本')
     publish({ type: 'artwork_version_applied', result })
+    publish({ type: 'editor_history_changed', history: database.getEditorHistory(artworkId), reason: 'edit' })
     return result.version
   }
-  const mcp = new LocalMcp(join(app.getPath('userData'), 'mcp-settings.json'), createStudioMcpTools(database, prepareGeneration, publish, posters, { retouch, applyVersion }))
+  const changeArtworkGroups = async (input: ArtworkGroupChangeInput) => {
+    const result = await database.changeArtworkGroups(input)
+    publish({ type: 'canvas_groups_changed', result })
+    return result
+  }
+  const mcp = new LocalMcp(join(app.getPath('userData'), 'mcp-settings.json'), createStudioMcpTools(
+    database, prepareGeneration, publish, posters, { retouch, applyVersion }, { photoEdits, editorContext }, changeArtworkGroups))
   ipcMain.handle('portrait:retouch', (_e, input: unknown) => retouch(input))
+  ipcMain.on('photo:editor-context', (event, input: unknown) => {
+    const parsed = editorSelectionInput.safeParse(input)
+    if (parsed.success) editorSelections.set(event.sender, parsed.data)
+  })
+  ipcMain.handle('photo:inspect', (_e, input: unknown) => photoEdits.inspect(input))
+  ipcMain.handle('photo:inspect-colors', (_e, input: unknown) => photoEdits.inspectColors(input))
+  ipcMain.handle('photo:suggest-crops', (_e, input: unknown) => photoEdits.suggestCrops(input))
+  ipcMain.handle('photo:edit-recipe', (_e, input: unknown) => photoEdits.recipe(input))
+  ipcMain.handle('photo:preview-mask', (_e, input: unknown) => photoEdits.previewMask(input))
+  ipcMain.handle('photo:preview-edit', (_e, input: unknown) => photoEdits.preview(input))
+  ipcMain.handle('photo:save-edit', (_e, draftId: string) => photoEdits.save(draftId))
+  ipcMain.handle('editor-history:get', (_e, artworkId: string) => posters.getEditorHistory(artworkId))
+  ipcMain.handle('editor-history:navigate', (_e, artworkId: string, revision: number, cursor: number) => posters.navigateEditorHistory(artworkId, revision, cursor))
   ipcMain.handle('poster:open', (_e, id: string, versionId?: string) => posters.open(id, versionId))
   ipcMain.handle('poster:edit', (_e, input: unknown) => posters.edit(input))
   ipcMain.handle('poster:undo', (_e, id: string, revision: number) => posters.undo(id, revision))
-  ipcMain.handle('poster:preview', (_e, id: string, size: PosterOutput['size']) => posters.preview(id, size))
+  ipcMain.handle('poster:preview', (_e, id: string, size?: PosterOutput['size'], transform?: unknown) => posters.preview(id, size, transform))
+  ipcMain.handle('poster:layer-mask-preview', (_e, id: string, layerId: unknown, revision: number) => posters.previewLayerMask(id, layerId, revision))
+  ipcMain.handle('poster:pixels-inspect', (_e, input: unknown) => posters.inspectLayerPixels(input))
+  ipcMain.handle('poster:pixels-paint', (_e, input: unknown) => posters.paintLayerPixels(input))
+  ipcMain.handle('poster:pixels-region-preview', (_e, input: unknown) => posters.previewLayerRegion(input))
+  ipcMain.handle('poster:pixels-region-save', (_e, draftId: string) => posters.saveLayerRegion(draftId))
   ipcMain.handle('poster:source', async (_e, id: string) => {
-    const source = await posters.previewSource(id, posters.get(id).sourceVersionId)
+    const source = await posters.previewSubjectSource(id)
     return `data:image/png;base64,${source.toString('base64')}`
   })
   ipcMain.handle('poster:export', (_e, id: string, options: PosterOutput) => posters.export(id, options))
@@ -102,6 +148,8 @@ if (isPrimaryInstance) void app.whenReady().then(async () => {
   ipcMain.handle('canvases:create', async (_e, id: string, name: string) => database.createCanvas(id, name))
   ipcMain.handle('canvases:rename', async (_e, id: string, name: string) => database.renameCanvas(id, name))
   ipcMain.handle('artworks:list', (_e, canvasId: string) => database.listArtworks(canvasId))
+  ipcMain.handle('canvas-groups:list', (_e, canvasId: unknown) => database.listArtworkGroups(listArtworkGroupsInput.parse({ canvasId }).canvasId))
+  ipcMain.handle('canvas-groups:change', (_e, input: unknown) => changeArtworkGroups(artworkGroupChangeInput.parse(input)))
   ipcMain.handle('artworks:save', async (_e, artworks) => { await database.saveArtworks(artworks); return true })
   ipcMain.handle('artworks:move', async (_e, id: string, x: number, y: number) => { await database.moveArtwork(id, x, y); return true })
   ipcMain.handle('artworks:delete', async (_e, id: string) => {
@@ -159,7 +207,7 @@ async function testModelConnection(config: ModelConfig) {
   }
 }
 
-async function generateImage(payload: GeneratePayload) {
+async function generateImage(payload: GeneratePayload, editMask?: Buffer) {
   const { prompt, size, count, quality, image } = payload
   const config = normalizeModelConfig(payload.config)
   if (!config.apiKey) throw new Error('请先在模型配置中填写 API Key')
@@ -176,6 +224,7 @@ async function generateImage(payload: GeneratePayload) {
     const extensions: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }
     if (config.provider === 'openai' && !extensions[mime]) throw new Error('OpenAI 图片编辑支持 PNG、JPEG 和 WebP 参考图片，请转换格式后重试')
     form.append('image[]', new Blob([Buffer.from(content, 'base64')], { type: mime }), `reference.${extensions[mime] || 'png'}`)
+    if (editMask) form.append('mask', new Blob([Uint8Array.from(editMask)], { type: 'image/png' }), 'selection.png')
     body = form
   } else {
     headers['Content-Type'] = 'application/json'

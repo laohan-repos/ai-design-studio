@@ -24,3 +24,65 @@ html, body, #root { height: 100%; overflow: hidden; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 999px; }
 .setting-select { @apply h-10 w-full rounded-md border bg-background px-3 text-xs outline-none focus:ring-2 focus:ring-ring; }
+
+.image-workbench {
+  --editor-dock-width: 336px;
+  color-scheme: light;
+  @apply fixed inset-0 z-50 flex flex-col overflow-hidden bg-background text-foreground;
+}
+.editor-titlebar {
+  @apply flex min-h-12 shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b bg-white py-2 pr-3 pl-[76px];
+}
+.editor-titlebar select, .editor-tool-options select {
+  @apply h-8 rounded-md border bg-background px-2 text-xs text-foreground;
+}
+.editor-tool-options button[aria-pressed="true"] {
+  @apply border-violet-200 bg-violet-50 text-violet-700;
+}
+.editor-workspace { @apply flex min-h-0 flex-1 flex-col md:flex-row; }
+.editor-tools {
+  @apply grid shrink-0 grid-cols-6 gap-1 border-b px-1.5 py-1 md:flex md:w-[58px] md:flex-col md:items-stretch md:overflow-y-auto md:border-b-0 md:border-r md:p-1.5;
+  scrollbar-width: none;
+}
+.editor-tools button {
+  @apply inline-flex h-10 min-w-0 shrink-0 flex-col items-center justify-center gap-0.5 whitespace-nowrap rounded-md text-[11px] font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-violet-400 md:h-[47px];
+}
+.editor-tools button[aria-pressed="true"] {
+  @apply bg-violet-50 text-violet-700 ring-1 ring-inset ring-violet-200;
+}
+.editor-tools button:disabled { @apply opacity-50; }
+.editor-surface { @apply flex h-full min-h-0 min-w-0 flex-col; }
+.editor-tool-options {
+  @apply flex min-h-11 shrink-0 items-center gap-2 overflow-x-auto border-b bg-white px-3 py-1.5;
+  scrollbar-width: none;
+}
+.editor-tool-options > * { @apply shrink-0; }
+.editor-tool-options h2 { @apply mr-1 text-xs font-semibold; }
+.editor-document { @apply flex min-h-0 flex-1 flex-col md:flex-row; }
+.editor-stage {
+  @apply relative flex h-[44%] min-h-0 min-w-0 shrink-0 flex-col overflow-hidden bg-slate-100 md:h-auto md:flex-1;
+}
+.editor-preview {
+  @apply relative flex min-h-0 min-w-0 flex-1 flex-col items-center justify-center overflow-hidden p-3 md:p-5 lg:p-7;
+}
+.editor-status {
+  @apply flex min-h-6 shrink-0 items-center gap-2 overflow-hidden border-t bg-background px-3 py-0.5 text-[11px] tabular-nums text-muted-foreground;
+}
+.editor-dock {
+  @apply flex min-h-0 min-w-0 flex-1 flex-col border-t border-slate-200 bg-slate-50 text-slate-900 md:flex-none md:border-l md:border-t-0;
+}
+.editor-dock-tabs { @apply grid shrink-0 grid-cols-4 gap-0.5 border-b bg-white px-1; }
+.editor-dock-tabs button {
+  @apply flex h-8 items-center justify-center gap-1.5 border-b-2 border-transparent text-xs font-medium text-slate-600 hover:bg-slate-50 hover:text-slate-900 focus-visible:outline focus-visible:outline-violet-500 md:h-10;
+}
+.editor-dock-tabs button[aria-pressed="true"] { @apply border-violet-600 text-violet-700; }
+.editor-dock-tabs button:disabled { @apply opacity-50; }
+.editor-panel { @apply min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain p-3 md:p-4; }
+.editor-panel-footer { @apply shrink-0 border-t bg-white p-2 md:p-3; }
+@media (min-width: 768px) {
+  .editor-dock { width: min(var(--editor-dock-width), 42vw); }
+}
+@media (max-width: 767px) {
+  .editor-document-expanded .editor-stage { @apply flex-1; }
+  .editor-document-expanded .editor-dock { display: none; }
+}
